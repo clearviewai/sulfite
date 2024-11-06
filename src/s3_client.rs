@@ -1,11 +1,10 @@
 use crate::retry_strategy::RetryStrategy;
 use crate::utils::generate_random_hex;
-use anyhow::{anyhow, bail, Context, Result};
-use aws_config::{timeout::TimeoutConfig, Region};
+use aws_config::{retry::RetryConfig, timeout::TimeoutConfig, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
-    error::SdkError,
-    primitives::{ByteStream, ByteStreamError, Length},
+    error::{ProvideErrorMetadata, SdkError},
+    primitives::{ByteStream, ByteStreamError, DateTime, Length},
     types::{
         CompletedMultipartUpload, CompletedPart, GlacierJobParameters, RestoreRequest,
         StorageClass, Tier,
@@ -13,10 +12,12 @@ use aws_sdk_s3::{
     Client as AWSS3Client, Error as AWSS3Error,
 };
 use bytes::Bytes;
+use core::str;
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
 use partial_application::partial;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::BufWriter;
 use tokio::{
@@ -24,11 +25,11 @@ use tokio::{
     sync::Semaphore,
 };
 use tokio_retry::strategy::jitter;
-use tokio_retry::RetryIf;
+use tokio_retry::{strategy::ExponentialBackoff, RetryIf};
 
+const RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[400, 403, 408, 429];
 const DEFAULT_REGION: &str = "us-east-1"; // AWS default
-const DEFAULT_TIMEOUT: u64 = 60; // boto default
-const DEFAULT_MAX_RETRIES: usize = 3; // emulate AWS SDK default
+const DEFAULT_READ_TIMEOUT: u64 = 60; // boto default
 const UPLOAD_BYTESTREAM_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 const MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20; // 20MB when filesize < 200GB
 const MULTIPART_MAX_CHUNKS: u64 = 10000; // API limit
@@ -36,8 +37,8 @@ const MULTIPART_MAX_CHUNKS: u64 = 10000; // API limit
 #[derive(Clone, Debug)]
 pub struct ObjectInfo {
     pub key: String,
-    pub size: usize,
-    pub timestamp: String,
+    pub size: u64,
+    pub timestamp: DateTime,
     pub storage_class: Option<String>,
     pub restore_status: Option<String>,
 }
@@ -47,40 +48,59 @@ pub struct CommonPrefixInfo {
     pub prefix: String,
 }
 
-pub type ListObjectsV2PaginateResp = Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)>;
-
 #[derive(Error, Debug)]
 pub enum S3Error {
+    #[error("{} [ConstructionFailure]", .0)]
+    ConstructionFailure(String),
     #[error("{} [TimeoutError]", .0)]
     TimeoutError(String),
-    # [error("{} [DispatchFailure]", .0)]
+    #[error("{} [DispatchFailure]", .0)]
     DispatchFailure(String),
     #[error("{} [ResponseError]", .0)]
     ResponseError(String),
-    #[error("{} [WasabiConnectionLimitExceeded]", .0)]
-    WasabiConnectionLimitExceeded(String),
-    #[error("{} [AccessDenied]", .0)]
-    AccessDenied(String),
-    #[error("{} [TooManyRequests]", .0)]
-    TooManyRequests(String),
-    #[error("{} [InternalError]", .0)]
-    InternalError(String),
-    #[error("{} [S3Error - {}]", .0, .1)]
-    S3Error(String, AWSS3Error),
-    #[error("{} [ByteStreamError - {}]", .0, .1)]
-    ByteStreamError(String, ByteStreamError),
+    #[error("{} [RetriableClientError]", .0)]
+    RetriableClientError(String),
+    #[error("{} [RetriableServerError]", .0)]
+    RetriableServerError(String),
+    #[error("{} [AWSS3Error - {}]", .0, .1)]
+    AWSS3Error(String, AWSS3Error),
+    #[error("{} [ByteStreamDownloadError - {}]", .0, .1)]
+    ByteStreamDownloadError(String, ByteStreamError),
+    #[error("{} [ByteStreamUploadError - {}]", .0, .1)]
+    ByteStreamUploadError(String, ByteStreamError),
+    #[error("{} [ValidationError]", .0)]
+    ValidationError(String),
+    #[error("{} [IOError]", .0)]
+    IOError(String),
+    #[error("{} [FieldNotExist]", .0)]
+    FieldNotExist(&'static str),
+    #[error("{} [RuntimeError]", .0)]
+    RuntimeError(&'static str),
+}
+
+impl From<std::io::Error> for S3Error {
+    fn from(e: std::io::Error) -> Self {
+        S3Error::IOError(e.to_string())
+    }
 }
 
 fn map_sdk_error<E>(context: String, e: SdkError<E>) -> S3Error
 where
     AWSS3Error: From<SdkError<E>>,
-    E: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
 {
     match &e {
-        SdkError::TimeoutError(_) => S3Error::TimeoutError(context),
+        SdkError::ConstructionFailure(construction_error) => {
+            debug!("[ConstructionFailure] {:?}", construction_error);
+            S3Error::ConstructionFailure(context)
+        }
+        SdkError::TimeoutError(timeout_error) => {
+            debug!("[TimeoutError] {:?}", timeout_error);
+            S3Error::TimeoutError(context)
+        }
         SdkError::DispatchFailure(dispatch_error) => {
             debug!(
-                "is_io: {} is_timeout: {} is_user: {} is_other: {} {:?}",
+                "[DispatchFailure] is_io: {} is_timeout: {} is_user: {} is_other: {} {:?}",
                 dispatch_error.is_io(),
                 dispatch_error.is_timeout(),
                 dispatch_error.is_user(),
@@ -91,78 +111,68 @@ where
         }
         SdkError::ResponseError(response_error) => {
             if let Some(bytes) = response_error.raw().body().bytes() {
-                if let Ok(raw_content) = String::from_utf8(bytes.to_vec()) {
-                    debug!("{}", raw_content);
+                if let Ok(raw_content) = str::from_utf8(&bytes) {
+                    debug!("[ResponseError] raw {}", raw_content);
                 }
             }
             S3Error::ResponseError(context)
         }
         SdkError::ServiceError(service_error) => {
+            let error_meta = e.meta();
+            debug!("[ServiceError] error_meta {:?}", error_meta);
             if let Some(bytes) = service_error.raw().body().bytes() {
-                if let Ok(raw_content) = String::from_utf8(bytes.to_vec()) {
-                    debug!("{}", raw_content);
+                if let Ok(raw_content) = str::from_utf8(&bytes) {
+                    debug!("[ServiceError] raw {}", raw_content);
                 }
             }
 
             let status_code = service_error.raw().status().as_u16();
-            if status_code == 403 {
-                // bypass due to wasabi's impl
-                if let Some(bytes) = service_error.raw().body().bytes() {
-                    if let Ok(raw_content) = String::from_utf8(bytes.to_vec()) {
-                        // debug!("{}", raw_content);
-                        if raw_content.contains("ConnectionLimitExceeded") {
-                            return S3Error::WasabiConnectionLimitExceeded(context);
-                        }
-                    }
-                }
-                S3Error::AccessDenied(context)
-                // S3Error::S3Error(context, AWSS3Error::from(e)) // would be unhandled error (AccessDenied) in current SDK
-            } else if status_code == 429 {
-                S3Error::TooManyRequests(context)
+            if RETRIABLE_CLIENT_STATUS_CODES.contains(&status_code) {
+                S3Error::RetriableClientError(context)
             } else if status_code >= 500 {
-                S3Error::InternalError(context)
+                S3Error::RetriableServerError(context)
             } else {
-                S3Error::S3Error(context, AWSS3Error::from(e))
+                S3Error::AWSS3Error(context, e.into())
             }
         }
         _ => {
             error!("{context} {:?}", e);
-            S3Error::S3Error(context, AWSS3Error::from(e))
+            S3Error::AWSS3Error(context, e.into())
         }
     }
 }
 
-fn map_bytestream_error(context: String, e: ByteStreamError) -> S3Error {
+fn map_bytestream_download_error(context: String, e: ByteStreamError) -> S3Error {
     debug!("{context} {:?}", e);
-    S3Error::ByteStreamError(context, e)
+    S3Error::ByteStreamDownloadError(context, e)
 }
 
-fn should_retry(e: &anyhow::Error) -> bool {
-    if let Some(e) = e.downcast_ref::<S3Error>() {
-        match e {
-            S3Error::TimeoutError(_)
-            | S3Error::DispatchFailure(_)
-            | S3Error::ResponseError(_)
-            | S3Error::WasabiConnectionLimitExceeded(_)
-            // | S3Error::AccessDenied(_) // sometimes rate limit is 403 for wasabi
-            | S3Error::TooManyRequests(_)
-            | S3Error::InternalError(_)
-            | S3Error::ByteStreamError(_, _)
-             => {
-                warn!("RetryIf: {}. Retrying...", e);
-                true
-            }
-            _ => {
-                // other S3Error errors
-                debug!("RetryIf: {}. Not retrying...", e);
-                false
-            }
+fn map_bytestream_upload_error(context: String, e: ByteStreamError) -> S3Error {
+    debug!("{context} {:?}", e);
+    S3Error::ByteStreamUploadError(context, e)
+}
+
+fn should_retry(e: &S3Error) -> bool {
+    match e {
+        S3Error::ConstructionFailure(_)
+        | S3Error::TimeoutError(_)
+        | S3Error::DispatchFailure(_)
+        | S3Error::ResponseError(_)
+        | S3Error::RetriableClientError(_)
+        | S3Error::RetriableServerError(_)
+        | S3Error::ByteStreamDownloadError(_, _) => {
+            info!("RetryIf: {}. Retrying...", e);
+            true
         }
-    } else {
-        // other errors
-        false
+        _ => {
+            // other S3Error errors
+            debug!("RetryIf: {}. Not retrying...", e);
+            false
+        }
     }
 }
+
+pub type Result<T> = std::result::Result<T, S3Error>;
 
 #[derive(Debug, Clone)]
 pub struct S3Client {
@@ -177,8 +187,8 @@ impl S3Client {
         endpoint_url: Option<String>,
         profile_name: Option<String>,
         access_secret_session_tuple: Option<(String, String, Option<String>)>,
-        operation_attempt_timeout_secs: Option<u64>,
-        retry_strategy: RetryStrategy,
+        read_timeout_secs: Option<u64>,
+        retry_strategy: Option<RetryStrategy>,
         max_retries: Option<usize>,
     ) -> Self {
         let mut config_loader = aws_config::from_env();
@@ -203,11 +213,16 @@ impl S3Client {
 
         config_loader = config_loader.timeout_config(
             TimeoutConfig::builder()
-                .operation_attempt_timeout(std::time::Duration::from_secs(
-                    operation_attempt_timeout_secs.unwrap_or(DEFAULT_TIMEOUT),
+                .read_timeout(Duration::from_secs(
+                    read_timeout_secs.unwrap_or(DEFAULT_READ_TIMEOUT),
                 ))
                 .build(),
         );
+
+        // if enrolling into high-level retries, disable low-level retries
+        if max_retries.is_some_and(|x| x > 0) {
+            config_loader = config_loader.retry_config(RetryConfig::disabled())
+        }
 
         let sdk_config = config_loader.load().await;
         let mut config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
@@ -222,20 +237,32 @@ impl S3Client {
 
         S3Client {
             client: AWSS3Client::from_conf(config_builder.build()),
-            retry_strategy,
-            max_retries: max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_strategy: retry_strategy.unwrap_or(RetryStrategy::ExponentialBackoff(
+                ExponentialBackoff::from_millis(2)
+                    .factor(100)
+                    .max_delay(Duration::from_secs(20)),
+            )),
+            max_retries: max_retries.unwrap_or(0),
         }
     }
 
     pub fn from_aws_s3_client(
         client: AWSS3Client,
-        retry_strategy: RetryStrategy,
+        retry_strategy: Option<RetryStrategy>,
         max_retries: Option<usize>,
     ) -> Self {
+        if max_retries.is_some_and(|x| x > 0) && client.config().retry_config().is_some() {
+            warn!("High-level retries enabled but low-level retries are also enabled.");
+        }
+
         S3Client {
             client,
-            retry_strategy,
-            max_retries: max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_strategy: retry_strategy.unwrap_or(RetryStrategy::ExponentialBackoff(
+                ExponentialBackoff::from_millis(2)
+                    .factor(100)
+                    .max_delay(Duration::from_secs(20)),
+            )),
+            max_retries: max_retries.unwrap_or(0),
         }
     }
 
@@ -244,7 +271,7 @@ impl S3Client {
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
-    ) -> ListObjectsV2PaginateResp {
+    ) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
         let mut builder = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
         if let Some(delimiter) = delimiter {
@@ -262,12 +289,11 @@ impl S3Client {
         {
             item.contents().into_iter().try_for_each(|object| {
                 objects.push(ObjectInfo {
-                    key: object.key().context("No such key!")?.into(),
-                    size: object.size().context("No such size!")? as usize,
+                    key: object.key().ok_or(S3Error::FieldNotExist("key"))?.into(),
+                    size: object.size().ok_or(S3Error::FieldNotExist("size"))? as u64,
                     timestamp: object
                         .last_modified()
-                        .context("No such timestamp!")?
-                        .to_string(),
+                        .ok_or(S3Error::FieldNotExist("timestamp"))?.to_owned(),
                     storage_class: object.storage_class().map(|sc| sc.as_str().to_owned()),
                     // restore_status is not populated for some reason - we leave the code placeholder for now
                     restore_status: object.restore_status().map(|rs| {
@@ -281,19 +307,19 @@ impl S3Client {
                         } else {
                             "N/A"
                         };
-                    let ts = rs.restore_expiry_date().map(|red| red.to_string());
-                        format!("Restoring {} (Expires: {})", is_restoring, ts.unwrap_or("N/A".to_owned()))
+                        let ts = rs.restore_expiry_date().map(|red| red.to_string());
+                        format!("{} (Expires: {})", is_restoring, ts.unwrap_or("N/A".to_owned()))
                     }),
                 });
-                anyhow::Ok(())
+                Result::Ok(())
             })?;
             item.common_prefixes()
                 .into_iter()
                 .try_for_each(|common_prefix| {
                     common_prefixes.push(CommonPrefixInfo {
-                        prefix: common_prefix.prefix().context("No such prefix!")?.into(),
+                        prefix: common_prefix.prefix().ok_or(S3Error::FieldNotExist("prefix"))?.into(),
                     });
-                    anyhow::Ok(())
+                    Result::Ok(())
                 })?;
         }
         Ok((objects, common_prefixes))
@@ -304,7 +330,7 @@ impl S3Client {
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
-    ) -> ListObjectsV2PaginateResp {
+    ) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
         let (objects, common_prefixes) = RetryIf::spawn(
             self.retry_strategy
                 .clone()
@@ -348,8 +374,13 @@ impl S3Client {
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: resp.content_length().context("No info!")? as usize,
-            timestamp: resp.last_modified().context("No info!")?.to_string(),
+            size: resp
+                .content_length()
+                .ok_or(S3Error::FieldNotExist("size"))? as u64,
+            timestamp: resp
+                .last_modified()
+                .ok_or(S3Error::FieldNotExist("timestamp"))?
+                .to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
             restore_status: resp.restore().map(|rs| rs.to_owned()),
         };
@@ -357,7 +388,11 @@ impl S3Client {
         debug!("Content length: {}", object_info.size);
         debug!("Last modified: {}", object_info.timestamp);
         debug!("Storage class: {:?}", object_info.storage_class);
-        debug!("Content type: {}", resp.content_type().context("No info!")?);
+        debug!(
+            "Content type: {}",
+            resp.content_type()
+                .ok_or(S3Error::FieldNotExist("content_type"))?
+        );
 
         Ok(object_info)
     }
@@ -372,7 +407,9 @@ impl S3Client {
 
         if let Some(start_end_offsets) = start_end_offsets {
             if start_end_offsets.1 <= start_end_offsets.0 {
-                bail!("Invalid start_end_offsets, non-positive slice!");
+                return Err(S3Error::ValidationError(
+                    "Invalid start_end_offsets, non-positive slice!".to_string(),
+                ));
             }
             let range = format!(
                 "bytes={}-{}",
@@ -389,8 +426,13 @@ impl S3Client {
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: resp.content_length().context("No info!")? as usize,
-            timestamp: resp.last_modified().context("No info!")?.to_string(),
+            size: resp
+                .content_length()
+                .ok_or(S3Error::FieldNotExist("size"))? as u64,
+            timestamp: resp
+                .last_modified()
+                .ok_or(S3Error::FieldNotExist("timestamp"))?
+                .to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
             restore_status: resp.restore().map(|rs| rs.to_owned()),
         };
@@ -399,13 +441,17 @@ impl S3Client {
         debug!("Content length: {}", object_info.size);
         debug!("Last modified: {}", object_info.timestamp);
         debug!("Storage class: {:?}", object_info.storage_class);
-        debug!("Content type: {}", resp.content_type().context("No info!")?);
+        debug!(
+            "Content type: {}",
+            resp.content_type()
+                .ok_or(S3Error::FieldNotExist("content_type"))?
+        );
 
         let content = resp
             .body
             .collect()
             .await
-            .map_err(partial!(map_bytestream_error => format!("<get_object> bucket={bucket} key={key}"), _))?
+            .map_err(partial!(map_bytestream_download_error => format!("<get_object> bucket={bucket} key={key}"), _))?
             .into_bytes().to_vec();
         Ok((object_info, content))
     }
@@ -440,7 +486,9 @@ impl S3Client {
 
         if let Some(start_end_offsets) = start_end_offsets {
             if start_end_offsets.1 <= start_end_offsets.0 {
-                bail!("Invalid start_end_offsets, non-positive slice!");
+                return Err(S3Error::ValidationError(
+                    "Invalid start_end_offsets, non-positive slice!".to_string(),
+                ));
             }
             let range = format!(
                 "bytes={}-{}",
@@ -457,14 +505,19 @@ impl S3Client {
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: resp.content_length().context("No info!")? as usize,
-            timestamp: resp.last_modified().context("No info!")?.to_string(),
+            size: resp
+                .content_length()
+                .ok_or(S3Error::FieldNotExist("size"))? as u64,
+            timestamp: resp
+                .last_modified()
+                .ok_or(S3Error::FieldNotExist("timestamp"))?
+                .to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
             restore_status: resp.restore().map(|rs| rs.to_owned()),
         };
 
         let local_path = local_path.to_owned();
-        let timestamp = resp.last_modified().context("No info!")?.clone();
+        let timestamp = object_info.timestamp.clone();
 
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
@@ -473,19 +526,12 @@ impl S3Client {
             tokio::fs::File::create(&local_path_tmp).await?,
         );
 
-        // let mut reader = BufReader::with_capacity(
-        //     1024 * 1024, // 1MB buffer
-        //     resp.body
-        //         .into_async_read()
-        // );
-        // tokio::io::copy(&mut reader, &mut file).await?;
-
         while let Some(bytes) =
             resp.body.try_next().await.map_err(
-                partial!(map_bytestream_error => format!("<download_object> bucket={bucket} key={key}"), _),
+                partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
             ).map_err(|e| {
                 // clean up
-                let _ = std::fs::remove_file(&local_path_tmp);
+                let _ = tokio::fs::remove_file(&local_path_tmp);
                 e
             })?
         {
@@ -500,9 +546,10 @@ impl S3Client {
                 filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
             )?;
             std::fs::rename(&local_path_tmp, &local_path)?;
-            anyhow::Ok(())
+            Result::Ok(())
         })
-        .await??;
+        .await
+        .unwrap()?;
 
         Ok(object_info)
     }
@@ -550,13 +597,18 @@ impl S3Client {
             .await
             .map_err(partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key}"), _))?;
 
-        let file_size = resp.content_length().context("No info!")? as u64;
-        let timestamp = resp.last_modified().context("No info!")?.to_owned();
+        let file_size = resp
+            .content_length()
+            .ok_or(S3Error::FieldNotExist("size"))? as u64;
+        let timestamp = resp
+            .last_modified()
+            .ok_or(S3Error::FieldNotExist("timestamp"))?
+            .to_owned();
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: file_size as usize,
-            timestamp: timestamp.to_string(),
+            size: file_size,
+            timestamp: timestamp.to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
             restore_status: resp.restore().map(|rs| rs.to_owned()),
         };
@@ -569,9 +621,10 @@ impl S3Client {
                     &local_path_,
                     filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
                 )?;
-                anyhow::Ok(())
+                Result::Ok(())
             })
-            .await??;
+            .await
+            .unwrap()?;
             debug!("Created blank file at {local_path}");
             return Ok(object_info);
         }
@@ -642,14 +695,15 @@ impl S3Client {
                         debug!("Streaming chunk {} to file", chunk_index);
 
                         while let Some(bytes) =
-                            resp.body.try_next().await.map_err(partial!(map_bytestream_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _))? 
+                            resp.body.try_next().await.map_err(
+                            partial!(map_bytestream_download_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _))?
                         {
                             file.write_all(&bytes).await?;
                         }
                         file.flush().await?;
                         debug!("Done streaming chunk {} to file", chunk_index);
 
-                        anyhow::Ok(())
+                        Ok(())
                     },
                     should_retry,
                 )
@@ -658,7 +712,7 @@ impl S3Client {
                 pb.map(|pb| {
                     pb.inc(1);
                 });
-                anyhow::Ok(())
+                Ok(())
             });
         }
 
@@ -674,7 +728,9 @@ impl S3Client {
                 }
             } else {
                 // canceled
-                res_ = Err(anyhow!("Multipart download of {local_path} was canceled!"));
+                res_ = Err(S3Error::RuntimeError(
+                    "Multipart download of {local_path} was canceled!",
+                ));
                 break;
             }
         }
@@ -688,9 +744,10 @@ impl S3Client {
                     filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
                 )?;
                 std::fs::rename(&local_path_tmp, &local_path_)?;
-                anyhow::Ok(())
+                Result::Ok(())
             })
-            .await??;
+            .await
+            .unwrap()?;
             debug!(
                 "Downloaded multipart from s3://{}/{} to {}",
                 bucket, key, local_path
@@ -763,7 +820,7 @@ impl S3Client {
             .build()
             .await
             .map_err(
-            partial!(map_bytestream_error => format!("<upload_object> bucket={bucket} key={key}"), _),
+            partial!(map_bytestream_upload_error => format!("<upload_object> bucket={bucket} key={key}"), _),
         )?;
         let mut builder = self.client.put_object().bucket(bucket).key(key).body(body);
 
@@ -848,15 +905,13 @@ impl S3Client {
 
         let upload_id = create_multipart_upload_output
             .upload_id()
-            .context("No upload id!")?;
+            .ok_or(S3Error::FieldNotExist("upload_id"))?;
 
         // prepare the file to upload - chunking scheme
         let mut multipart_chunk_size = MULTIPART_CHUNK_SIZE;
         if file_size > MULTIPART_CHUNK_SIZE * MULTIPART_MAX_CHUNKS {
             multipart_chunk_size = file_size / (MULTIPART_MAX_CHUNKS - 1);
-            debug!(
-                "File size larger than 200GB. Using adaptive chunk size {multipart_chunk_size}."
-            );
+            info!("File size larger than 200GB. Using adaptive chunk size {multipart_chunk_size}.");
         }
 
         let mut chunk_count = (file_size / multipart_chunk_size) + 1;
@@ -904,7 +959,7 @@ impl S3Client {
                         .offset(chunk_index * MULTIPART_CHUNK_SIZE)
                         .length(Length::Exact(this_chunk))
                         .build()
-                        .await.map_err(partial!(map_bytestream_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), _))?;
+                        .await.map_err(partial!(map_bytestream_upload_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), _))?;
 
                     // Chunk index needs to start at 0, but part numbers start at 1.
                     let part_number = (chunk_index as i32) + 1;
@@ -920,7 +975,7 @@ impl S3Client {
                         .map_err(
                             partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), _),
                         )?;
-                        anyhow::Ok((part_number, upload_part_output))
+                        Ok((part_number, upload_part_output))
                     },
                     should_retry,
                 )
@@ -929,8 +984,8 @@ impl S3Client {
                 pb.map(|pb| {
                     pb.inc(1);
                 });
-                anyhow::Ok((
-                    upload_part_output.e_tag.context("No etag!")?,
+                Ok((
+                    upload_part_output.e_tag.ok_or(S3Error::FieldNotExist("etag"))?,
                     part_number,
                 ))
             });
@@ -959,7 +1014,9 @@ impl S3Client {
                 }
             } else {
                 // canceled
-                res_ = Err(anyhow!("Multipart upload of {local_path} was canceled!"));
+                res_ = Err(S3Error::RuntimeError(
+                    "Multipart upload of {local_path} was canceled!",
+                ));
                 break;
             }
         }
@@ -987,7 +1044,7 @@ impl S3Client {
         if upload_parts.len() != chunk_count as usize {
             error!("<upload_object_multipart> bucket={bucket} key={key} Chunk count not lined up! Abort multipart upload.");
             abort().await;
-            bail!("Failed to upload all parts!");
+            return Err(S3Error::RuntimeError("Failed to upload all parts!"));
         }
 
         // sort by part number
@@ -1015,7 +1072,7 @@ impl S3Client {
                     .send()
                     .await
                     .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), _))?;
-                anyhow::Ok(complete_multipart_upload_output)
+                Ok(complete_multipart_upload_output)
             },
             should_retry,
         ).await;
@@ -1074,22 +1131,6 @@ impl S3Client {
                     .copy_source(format!("{}/{}", src_bucket, src_key));
 
                 if let Some(storage_class) = storage_class {
-                    // let storage_class = match storage_class {
-                    //     "STANDARD" => StorageClass::Standard,
-                    //     "REDUCED_REDUNDANCY" => StorageClass::ReducedRedundancy,
-                    //     "STANDARD_IA" => StorageClass::StandardIa,
-                    //     "ONEZONE_IA" => StorageClass::OnezoneIa,
-                    //     "INTELLIGENT_TIERING" => StorageClass::IntelligentTiering,
-                    //     "GLACIER" => StorageClass::Glacier,
-                    //     "DEEP_ARCHIVE" => StorageClass::DeepArchive,
-                    //     "OUTPOSTS" => StorageClass::Outposts,
-                    //     "GLACIER_IR" => StorageClass::GlacierIr,
-                    //     "SNOW" => StorageClass::Snow,
-                    //     "EXPRESS_ONEZONE" => StorageClass::ExpressOnezone,
-                    //     _ => {
-                    //         bail!("Invalid storage class: {}", storage_class);
-                    //     }
-                    // };
                     let storage_class = StorageClass::from(storage_class);
                     builder = builder.storage_class(storage_class);
                 }
@@ -1123,7 +1164,7 @@ impl S3Client {
             self.retry_strategy.clone().map(jitter).take(self.max_retries),
             || async {
                 let restore_request = RestoreRequest::builder().days(days).glacier_job_parameters(
-                    GlacierJobParameters::builder().tier(Tier::from(tier)).build()?
+                    GlacierJobParameters::builder().tier(Tier::from(tier)).build().map_err(|e| S3Error::ValidationError(e.to_string()))?
                 ).build();
                 self.client
                     .restore_object()
