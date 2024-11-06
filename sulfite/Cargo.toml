@@ -1,7 +1,15 @@
 [package]
-name = "s3-surfer"
+name = "sulfite"
 version = "0.0.1"
 edition = "2021"
+authors = ["Terence Liu terence.liu@clearview.ai>"]
+description = "A high-level S3 client built on AWS SDK for Rust for bandwidth saturation"
+license = "MIT"
+homepage = "https://github.com/clearviewai/sulfite"
+repository = "https://github.com/clearviewai/sulfite"
+readme = "README.md"
+keywords = ["s3", "object", "storage"]
+categories = ["Web programming"]
 
 [dependencies]
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }

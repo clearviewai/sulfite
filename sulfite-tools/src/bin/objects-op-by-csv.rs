@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use futures::{stream, StreamExt};
 use log::{debug, error, info};
-use s3_surfer::s3_client;
-use s3_surfer::utils::make_progress_bar;
+use sulfite::s3_client;
+use sulfite::utils::make_progress_bar;
 
 #[derive(Parser)]
 struct Cli {

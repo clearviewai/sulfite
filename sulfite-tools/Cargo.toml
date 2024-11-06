@@ -1,10 +1,10 @@
 [package]
-name = "s3-surfer-tools"
+name = "sulfite-tools"
 version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-s3-surfer = { path = "../s3-surfer" }
+sulfite = { path = "../sulfite" }
 
 anyhow = "1.0"
 env_logger = "0.11.0"

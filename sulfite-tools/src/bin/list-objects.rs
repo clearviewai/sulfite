@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
-use s3_surfer::s3_client;
+use sulfite::s3_client;
 
 #[derive(Parser)]
 struct Cli {

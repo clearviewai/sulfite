@@ -1818,39 +1818,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 
 [[package]]
-name = "s3-surfer"
-version = "0.0.1"
-dependencies = [
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "bytes",
- "filetime",
- "indicatif",
- "log",
- "partial_application",
- "rand",
- "thiserror",
- "tokio",
- "tokio-retry",
-]
-
-[[package]]
-name = "s3-surfer-tools"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "colored",
- "csv",
- "env_logger",
- "futures",
- "log",
- "s3-surfer",
- "tokio",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2043,6 +2010,39 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sulfite"
+version = "0.0.1"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "bytes",
+ "filetime",
+ "indicatif",
+ "log",
+ "partial_application",
+ "rand",
+ "thiserror",
+ "tokio",
+ "tokio-retry",
+]
+
+[[package]]
+name = "sulfite-tools"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "csv",
+ "env_logger",
+ "futures",
+ "log",
+ "sulfite",
+ "tokio",
+]
 
 [[package]]
 name = "syn"

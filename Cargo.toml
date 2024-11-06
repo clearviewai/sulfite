@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "s3-surfer",
-    "s3-surfer-tools",
+    "sulfite",
+    "sulfite-tools",
 ]
 
 [profile.dev.package."*"]
