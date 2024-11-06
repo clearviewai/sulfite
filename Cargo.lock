@@ -2039,6 +2039,7 @@ dependencies = [
  "csv",
  "env_logger",
  "futures",
+ "indicatif",
  "log",
  "sulfite",
  "tokio",

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
-use sulfite::s3_client;
+use sulfite::S3Client;
 
 #[derive(Parser)]
 struct Cli {
@@ -42,9 +42,7 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::parse();
 
-    let client =
-        s3_client::S3Client::new(args.region, args.endpoint_url, None, None, None, None, None)
-            .await;
+    let client = S3Client::new(args.region, args.endpoint_url, None, None, None, None, None).await;
 
     // list objects
     let (objects, common_prefixes) = client

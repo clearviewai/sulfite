@@ -12,5 +12,6 @@ colored = "2.1.0"
 clap = { version = "4.4.10", features = ["derive"] }
 csv = "1.3.0"
 futures = "0.3.29"
+indicatif = { version = "0.17.7", features = ["tokio"] }
 log = "0.4.20"
 tokio = { version = "1", features = ["full"] }

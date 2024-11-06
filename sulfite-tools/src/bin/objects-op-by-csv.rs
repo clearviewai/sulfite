@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use futures::{stream, StreamExt};
 use log::{debug, error, info};
-use sulfite::s3_client;
-use sulfite::utils::make_progress_bar;
+use sulfite::S3Client;
+use sulfite_tools::utils::make_progress_bar;
 
 #[derive(Parser)]
 struct Cli {
@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::parse();
 
-    let client = s3_client::S3Client::new(
+    let client = S3Client::new(
         args.region,
         args.endpoint_url,
         None,
