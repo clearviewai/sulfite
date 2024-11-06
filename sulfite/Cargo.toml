@@ -7,9 +7,9 @@ description = "A high-level S3 client built on AWS SDK for Rust for bandwidth sa
 license = "MIT"
 homepage = "https://github.com/clearviewai/sulfite"
 repository = "https://github.com/clearviewai/sulfite"
-readme = "README.md"
+readme = "../README.md"
 keywords = ["s3", "object", "storage"]
-categories = ["Web programming"]
+categories = ["web-programming::http-client"]
 
 [dependencies]
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
