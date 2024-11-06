@@ -154,8 +154,7 @@ fn map_bytestream_upload_error(context: String, e: ByteStreamError) -> S3Error {
 
 fn should_retry(e: &S3Error) -> bool {
     match e {
-        S3Error::ConstructionFailure(_)
-        | S3Error::TimeoutError(_)
+        S3Error::TimeoutError(_)
         | S3Error::DispatchFailure(_)
         | S3Error::ResponseError(_)
         | S3Error::RetriableClientError(_)

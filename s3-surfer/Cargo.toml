@@ -1,0 +1,18 @@
+[package]
+name = "s3-surfer"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-credential-types = { version = "1.2", features = ["hardcoded-credentials"] }
+aws-sdk-s3 = "1.30"
+bytes = "1"
+filetime = "0.2.14"
+indicatif = { version = "0.17.7", features = ["tokio"] }
+log = "0.4.20"
+partial_application = "0.2.1"
+rand = "0.8.5"
+tokio = { version = "1", features = ["full"] }
+tokio-retry = "0.3.0"
+thiserror = "1"

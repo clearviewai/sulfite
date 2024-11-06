@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
                         }
                         let key = format!("{prefix}{key}{suffix}");
 
-                        // skip if exists - need to make sure existing files were downloaded without interruption
+                        // skip if exists
                         if std::path::Path::new(&local_path).exists() {
                             pb.as_ref().map(|pb| {
                                 pb.set_message(format!("{key} already exists locally."));
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
                         }
                         let key = format!("{prefix}{key}{suffix}");
 
-                        // skip if exists - need to make sure existing files were downloaded without interruption
+                        // skip if exists
                         if std::path::Path::new(&local_path).exists() {
                             pb.as_ref().map(|pb| {
                                 pb.set_message(format!("{key} already exists locally."));

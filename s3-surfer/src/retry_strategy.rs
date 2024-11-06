@@ -1,5 +1,5 @@
 use std::time::Duration;
-use tokio_retry::strategy::{ExponentialBackoff, FibonacciBackoff, FixedInterval};
+pub use tokio_retry::strategy::{ExponentialBackoff, FibonacciBackoff, FixedInterval};
 
 #[derive(Debug, Clone)]
 pub enum RetryStrategy {
