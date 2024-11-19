@@ -1,6 +1,6 @@
 [package]
 name = "sulfite"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["Terence Liu terence.liu@clearview.ai>"]
 description = "A high-level S3 client built on AWS SDK for Rust for bandwidth saturation"
@@ -23,4 +23,4 @@ partial_application = "0.2.1"
 rand = "0.8.5"
 tokio = { version = "1", features = ["full"] }
 tokio-retry = "0.3.0"
-thiserror = "1"
+thiserror = "2"
