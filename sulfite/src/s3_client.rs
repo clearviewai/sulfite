@@ -19,13 +19,14 @@ use partial_application::partial;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::BufWriter;
 use tokio::{
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::Semaphore,
 };
-use tokio_retry::strategy::jitter;
-use tokio_retry::{strategy::ExponentialBackoff, RetryIf};
+use tokio_retry::{
+    strategy::{jitter, ExponentialBackoff},
+    RetryIf,
+};
 
 const RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[400, 403, 408, 429];
 const DEFAULT_REGION: &str = "us-east-1"; // AWS default
@@ -245,17 +246,17 @@ impl S3Client {
         }
     }
 
-    pub fn from_aws_s3_client(
-        client: AWSS3Client,
+    pub fn new_with_aws_s3_client(
+        aws_s3_client: AWSS3Client,
         retry_strategy: Option<RetryStrategy>,
         max_retries: Option<usize>,
     ) -> Self {
-        if max_retries.is_some_and(|x| x > 0) && client.config().retry_config().is_some() {
+        if max_retries.is_some_and(|x| x > 0) && aws_s3_client.config().retry_config().is_some() {
             warn!("High-level retries enabled but low-level retries are also enabled.");
         }
 
         S3Client {
-            client,
+            client: aws_s3_client,
             retry_strategy: retry_strategy.unwrap_or(RetryStrategy::ExponentialBackoff(
                 ExponentialBackoff::from_millis(2)
                     .factor(100)

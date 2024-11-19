@@ -16,7 +16,7 @@ The AWS SDK is a little low-level for users to take advantage of the concurrency
 
 1. You need to orchestrate the parallel multipart download & upload for large files.
 2. The built-in retry settings are too low-level, and we allow installing higher-level retries.
-3. The async API doesn't agree well with file system, especially for streaming small chunks from/to disk.
+3. The async API doesn't agree well with the filesystem, especially for streaming small chunks from/to disk.
 
 To address them, we provide implementations for the parallel multipart download & upload, and higher-level retries. We also make sure the on-disk file is adequately buffered to avoid task-threading overhead.
 
