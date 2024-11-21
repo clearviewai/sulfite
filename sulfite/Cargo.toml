@@ -1,6 +1,6 @@
 [package]
 name = "sulfite"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 authors = ["Terence Liu terence.liu@clearview.ai>"]
 description = "A high-level S3 client built on AWS SDK for Rust for bandwidth saturation"

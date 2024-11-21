@@ -956,7 +956,7 @@ impl S3Client {
                     let body = ByteStream::read_from()
                         .path(&local_path)
                         .buffer_size(UPLOAD_BYTESTREAM_BUFFER_SIZE)
-                        .offset(chunk_index * MULTIPART_CHUNK_SIZE)
+                        .offset(chunk_index * multipart_chunk_size)
                         .length(Length::Exact(this_chunk))
                         .build()
                         .await.map_err(partial!(map_bytestream_upload_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), _))?;
