@@ -3,7 +3,7 @@ use crate::utils::generate_random_hex;
 use aws_config::{retry::RetryConfig, timeout::TimeoutConfig, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
-    error::{ProvideErrorMetadata, SdkError},
+    error::{ErrorMetadata, ProvideErrorMetadata, SdkError},
     primitives::{ByteStream, ByteStreamError, DateTime, Length},
     types::{
         CompletedMultipartUpload, CompletedPart, GlacierJobParameters, RestoreRequest,
@@ -14,7 +14,7 @@ use aws_sdk_s3::{
 use bytes::Bytes;
 use core::str;
 #[allow(unused_imports)]
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use partial_application::partial;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,12 +59,14 @@ pub enum S3Error {
     DispatchFailure(String),
     #[error("{} [ResponseError]", .0)]
     ResponseError(String),
-    #[error("{} [RetriableClientError]", .0)]
-    RetriableClientError(String),
-    #[error("{} [RetriableServerError]", .0)]
-    RetriableServerError(String),
-    #[error("{} [AWSS3Error - {}]", .0, .1)]
-    AWSS3Error(String, AWSS3Error),
+    #[error("{} [RetriableClientError - {} {} {}]", .0, .1, .2, .3)]
+    RetriableClientError(String, AWSS3Error, ErrorMetadata, u16),
+    #[error("{} [RetriableServerError - {} {} {}]", .0, .1, .2, .3)]
+    RetriableServerError(String, AWSS3Error, ErrorMetadata, u16),
+    #[error("{} [AWSS3Error - {} {} {}]", .0, .1, .2, .3)]
+    AWSS3Error(String, AWSS3Error, ErrorMetadata, u16),
+    #[error("{} [OtherSDKError - {}]", .0, .1)]
+    OtherSDKError(String, AWSS3Error),
     #[error("{} [ByteStreamDownloadError - {}]", .0, .1)]
     ByteStreamDownloadError(String, ByteStreamError),
     #[error("{} [ByteStreamUploadError - {}]", .0, .1)]
@@ -113,32 +115,41 @@ where
         SdkError::ResponseError(response_error) => {
             if let Some(bytes) = response_error.raw().body().bytes() {
                 if let Ok(raw_content) = str::from_utf8(&bytes) {
-                    debug!("[ResponseError] raw {}", raw_content);
+                    if raw_content.len() > 0 {
+                        debug!("[ResponseError] raw {}", raw_content);
+                    }
                 }
             }
             S3Error::ResponseError(context)
         }
         SdkError::ServiceError(service_error) => {
-            let error_meta = e.meta();
-            debug!("[ServiceError] error_meta {:?}", error_meta);
             if let Some(bytes) = service_error.raw().body().bytes() {
                 if let Ok(raw_content) = str::from_utf8(&bytes) {
-                    debug!("[ServiceError] raw {}", raw_content);
+                    if raw_content.len() > 0 {
+                        debug!("[ServiceError] raw {}", raw_content);
+                    }
                 }
             }
 
+            let error_meta = e.meta().to_owned();
+            debug!("[ServiceError] error_meta {:?}", error_meta);
+
             let status_code = service_error.raw().status().as_u16();
+            debug!("[ServiceError] status_code {}", status_code);
+
             if RETRIABLE_CLIENT_STATUS_CODES.contains(&status_code) {
-                S3Error::RetriableClientError(context)
+                S3Error::RetriableClientError(context, e.into(), error_meta, status_code)
+            } else if error_meta.code() == Some("SlowDown") {
+                S3Error::RetriableClientError(context, e.into(), error_meta, status_code)
             } else if status_code >= 500 {
-                S3Error::RetriableServerError(context)
+                S3Error::RetriableServerError(context, e.into(), error_meta, status_code)
             } else {
-                S3Error::AWSS3Error(context, e.into())
+                S3Error::AWSS3Error(context, e.into(), error_meta, status_code)
             }
         }
         _ => {
             error!("{context} {:?}", e);
-            S3Error::AWSS3Error(context, e.into())
+            S3Error::OtherSDKError(context, e.into())
         }
     }
 }
@@ -158,8 +169,8 @@ fn should_retry(e: &S3Error) -> bool {
         S3Error::TimeoutError(_)
         | S3Error::DispatchFailure(_)
         | S3Error::ResponseError(_)
-        | S3Error::RetriableClientError(_)
-        | S3Error::RetriableServerError(_)
+        | S3Error::RetriableClientError(_, _, _, _)
+        | S3Error::RetriableServerError(_, _, _, _)
         | S3Error::ByteStreamDownloadError(_, _) => {
             info!("RetryIf: {}. Retrying...", e);
             true
@@ -407,9 +418,10 @@ impl S3Client {
 
         if let Some(start_end_offsets) = start_end_offsets {
             if start_end_offsets.1 <= start_end_offsets.0 {
-                return Err(S3Error::ValidationError(
-                    "Invalid start_end_offsets, non-positive slice!".to_string(),
-                ));
+                return Err(S3Error::ValidationError(format!(
+                    "Invalid start_end_offsets, non-positive slice: start {} end {}!",
+                    start_end_offsets.1, start_end_offsets.0
+                )));
             }
             let range = format!(
                 "bytes={}-{}",
@@ -486,9 +498,10 @@ impl S3Client {
 
         if let Some(start_end_offsets) = start_end_offsets {
             if start_end_offsets.1 <= start_end_offsets.0 {
-                return Err(S3Error::ValidationError(
-                    "Invalid start_end_offsets, non-positive slice!".to_string(),
-                ));
+                return Err(S3Error::ValidationError(format!(
+                    "Invalid start_end_offsets, non-positive slice: start {} end {}!",
+                    start_end_offsets.1, start_end_offsets.0
+                )));
             }
             let range = format!(
                 "bytes={}-{}",
@@ -574,7 +587,7 @@ impl S3Client {
         )
         .await?;
 
-        debug!("Downloaded from s3://{}/{} to {}", bucket, key, local_path);
+        trace!("Downloaded from s3://{}/{} to {}", bucket, key, local_path);
 
         Ok(obj)
     }
@@ -692,8 +705,8 @@ impl S3Client {
                                 .open(&local_path_tmp).await?,
                         );
                         file.seek(std::io::SeekFrom::Start(start_offset)).await?;
-                        debug!("Streaming chunk {} to file", chunk_index);
 
+                        debug!("Streaming chunk {} to file", chunk_index);
                         while let Some(bytes) =
                             resp.body.try_next().await.map_err(
                             partial!(map_bytestream_download_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _))?
@@ -748,9 +761,11 @@ impl S3Client {
             })
             .await
             .unwrap()?;
-            debug!(
+            trace!(
                 "Downloaded multipart from s3://{}/{} to {}",
-                bucket, key, local_path
+                bucket,
+                key,
+                local_path
             );
         } else {
             let _ = tokio::fs::remove_file(&local_path_tmp).await;
@@ -802,7 +817,7 @@ impl S3Client {
         )
         .await?;
 
-        debug!("Put from memory to s3://{}/{}", bucket, key);
+        trace!("Put from memory to s3://{}/{}", bucket, key);
 
         Ok(())
     }
@@ -855,7 +870,7 @@ impl S3Client {
         )
         .await?;
 
-        debug!("Uploaded from {} to s3://{}/{}", local_path, bucket, key);
+        trace!("Uploaded from {} to s3://{}/{}", local_path, bucket, key);
 
         Ok(())
     }
@@ -1109,7 +1124,7 @@ impl S3Client {
         )
         .await?;
 
-        debug!("Deleted s3://{}/{}", bucket, key);
+        trace!("Deleted s3://{}/{}", bucket, key);
         Ok(())
     }
 
@@ -1128,7 +1143,7 @@ impl S3Client {
                     .copy_object()
                     .bucket(dest_bucket)
                     .key(dest_key)
-                    .copy_source(format!("{}/{}", src_bucket, src_key));
+                    .copy_source(urlencoding::encode(&format!("{}/{}", src_bucket, src_key)));
 
                 if let Some(storage_class) = storage_class {
                     let storage_class = StorageClass::from(storage_class);
@@ -1145,9 +1160,13 @@ impl S3Client {
         )
         .await?;
 
-        debug!(
+        trace!(
             "Copied s3://{}/{} to s3://{}/{} (storage_class={:?})",
-            src_bucket, src_key, dest_bucket, dest_key, storage_class
+            src_bucket,
+            src_key,
+            dest_bucket,
+            dest_key,
+            storage_class
         );
 
         Ok(())
@@ -1180,9 +1199,12 @@ impl S3Client {
         )
         .await?;
 
-        debug!(
+        trace!(
             "Restored s3://{}/{} (days={}, tier={})",
-            bucket, key, days, tier
+            bucket,
+            key,
+            days,
+            tier
         );
 
         Ok(())
