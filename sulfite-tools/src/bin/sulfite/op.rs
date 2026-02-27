@@ -1,62 +1,18 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
 use sulfite::{RetryConfig, S3Client, S3ClientConfig};
 use sulfite_tools::utils::make_progress_bar;
 
-#[derive(Parser)]
-struct Cli {
-    /// Operation: head, download, download-multipart, upload, upload-multipart, delete, copy, restore
-    op: String,
-    /// The bucket name
-    #[clap(short, long)]
-    bucket: String,
-    /// The key in a bucket
-    #[clap(short, short_alias = 'p', long)]
-    key: String,
-    /// local_path
-    #[clap(short, long)]
-    local_path: Option<String>,
-    /// start offset
-    #[clap(long)]
-    start_offset: Option<usize>,
-    /// end offset
-    #[clap(long)]
-    end_offset: Option<usize>,
-    /// src_bucket: source bucket for copy operation
-    #[clap(long)]
-    src_bucket: Option<String>,
-    /// src_key: source key for copy operation
-    #[clap(long)]
-    src_key: Option<String>,
-    /// storage_class: STANDARD, GLACIER, DEEP_ARCHIVE, ...
-    #[clap(long)]
-    storage_class: Option<String>,
-    /// restore tier: Bulk, Standard, (and Expedited for Glacier)
-    #[clap(long, default_value = "Standard")]
-    restore_tier: String,
-    /// restore days
-    #[clap(long, default_value = "1")]
-    restore_days: i32,
-    /// The region
-    #[clap(short, long)]
-    region: Option<String>,
-    /// The endpoint URL
-    #[clap(short, long)]
-    endpoint_url: Option<String>,
-    /// n_workers
-    #[clap(short, long, default_value = "250")]
-    n_workers: usize,
-}
+use crate::OpArgs;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let args = Cli::parse();
-
+pub async fn run_op(
+    region: &Option<String>,
+    endpoint_url: &Option<String>,
+    args: OpArgs,
+) -> Result<()> {
     let client = S3Client::new(
         S3ClientConfig {
-            region: args.region,
-            endpoint_url: args.endpoint_url,
+            region: region.clone(),
+            endpoint_url: endpoint_url.clone(),
             ..Default::default()
         },
         RetryConfig {

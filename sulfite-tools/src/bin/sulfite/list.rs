@@ -1,51 +1,18 @@
 use anyhow::Result;
-use clap::Parser;
 use colored::Colorize;
 use sulfite::{RetryConfig, S3Client, S3ClientConfig};
 
-#[derive(Parser)]
-struct Cli {
-    /// The bucket name
-    #[clap(short, long)]
-    bucket: String,
-    /// The prefix in a bucket
-    #[clap(short, long)]
-    prefix: String,
-    /// The suffix name for records storage
-    #[clap(short, long, default_value = "")]
-    suffix: String,
-    /// The delimiter, default to '/' for ease and consistency with aws-cli
-    #[clap(short, long, default_value = "/")]
-    delimiter: Option<String>,
-    /// head
-    #[clap(long, default_value = "10")]
-    head: usize,
-    /// Output dir
-    #[clap(short, long)]
-    output_path: Option<String>,
-    /// keep the prefix from the key in the output file - by default it is removed
-    #[clap(long, default_value = "false")]
-    keep_prefix: bool,
-    /// remove the suffix from the key in the output file - by default it is kept
-    #[clap(long, default_value = "false")]
-    remove_suffix: bool,
-    /// The region
-    #[clap(short, long)]
-    region: Option<String>,
-    /// The endpoint URL
-    #[clap(short, long)]
-    endpoint_url: Option<String>,
-}
+use crate::ListArgs;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let args = Cli::parse();
-
+pub async fn run_list(
+    region: &Option<String>,
+    endpoint_url: &Option<String>,
+    args: ListArgs,
+) -> Result<()> {
     let client = S3Client::new(
         S3ClientConfig {
-            region: args.region,
-            endpoint_url: args.endpoint_url,
+            region: region.clone(),
+            endpoint_url: endpoint_url.clone(),
             ..Default::default()
         },
         RetryConfig {
@@ -94,7 +61,7 @@ async fn main() -> Result<()> {
     }
 
     println!("{}", format!("Found {} objects.", objects.len()).bold());
-    if objects.len() > 0 {
+    if !objects.is_empty() {
         println!(
             "{}",
             format!(
@@ -124,8 +91,8 @@ async fn main() -> Result<()> {
         "{}",
         format!("Found {} common prefixes.", common_prefixes.len()).bold()
     );
-    if common_prefixes.len() > 0 {
-        println!("{}", format!("Listing...",).italic().underline());
+    if !common_prefixes.is_empty() {
+        println!("{}", "Listing...".italic().underline());
     }
     common_prefixes.iter().for_each(|common_prefix| {
         println!("  {}", common_prefix.prefix.replace(prefix, "").bold());
