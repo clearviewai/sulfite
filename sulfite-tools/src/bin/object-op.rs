@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use sulfite::S3Client;
+use sulfite::{RetryConfig, S3Client, S3ClientConfig};
 use sulfite_tools::utils::make_progress_bar;
 
 #[derive(Parser)]
@@ -54,13 +54,15 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
 
     let client = S3Client::new(
-        args.region,
-        args.endpoint_url,
-        None,
-        None,
-        None,
-        None,
-        Some(10),
+        S3ClientConfig {
+            region: args.region,
+            endpoint_url: args.endpoint_url,
+            ..Default::default()
+        },
+        RetryConfig {
+            max_retries: 10,
+            ..Default::default()
+        },
     )
     .await;
 

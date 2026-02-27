@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
-use sulfite::S3Client;
+use sulfite::{RetryConfig, S3Client, S3ClientConfig};
 
 #[derive(Parser)]
 struct Cli {
@@ -42,7 +42,18 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Cli::parse();
 
-    let client = S3Client::new(args.region, args.endpoint_url, None, None, None, None, None).await;
+    let client = S3Client::new(
+        S3ClientConfig {
+            region: args.region,
+            endpoint_url: args.endpoint_url,
+            ..Default::default()
+        },
+        RetryConfig {
+            max_retries: 10,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // list objects
     let (objects, common_prefixes) = client

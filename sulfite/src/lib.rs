@@ -1,7 +1,8 @@
 #![doc = include_str!("../../README.md")]
 
-pub mod retry_strategy;
+mod retry_strategy;
 mod s3_client;
 mod utils;
 
-pub use s3_client::{CommonPrefixInfo, ObjectInfo, S3Client};
+pub use retry_strategy::RetryStrategy;
+pub use s3_client::{CommonPrefixInfo, ObjectInfo, RetryConfig, S3Client, S3ClientConfig};

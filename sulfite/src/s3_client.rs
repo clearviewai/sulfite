@@ -1,6 +1,6 @@
 use crate::retry_strategy::RetryStrategy;
 use crate::utils::generate_random_hex;
-use aws_config::{retry::RetryConfig, timeout::TimeoutConfig, Region};
+use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     error::{ErrorMetadata, ProvideErrorMetadata, SdkError},
@@ -23,17 +23,56 @@ use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::Semaphore,
 };
-use tokio_retry::{
-    strategy::{jitter, ExponentialBackoff},
-    RetryIf,
-};
+use tokio_retry::RetryIf;
 
-const RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[400, 403, 408, 429];
-const DEFAULT_REGION: &str = "us-east-1"; // AWS default
 const DEFAULT_READ_TIMEOUT: u64 = 60; // boto default
+const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[400, 403, 408, 429];
+const FALLBACK_REGION: &str = "us-east-1"; // AWS fallback region
 const UPLOAD_BYTESTREAM_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 const MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20; // 20MB when filesize < 200GB
 const MULTIPART_MAX_CHUNKS: u64 = 10000; // API limit
+
+/// Configuration for the underlying AWS S3 client (region, endpoint, credentials, timeouts)
+#[derive(Clone, Debug)]
+pub struct S3ClientConfig {
+    pub region: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub profile_name: Option<String>,
+    pub access_secret_session_tuple: Option<(String, String, Option<String>)>,
+    // Read timeout in seconds (default: 60 seconds)
+    pub read_timeout_secs: u64,
+}
+
+impl Default for S3ClientConfig {
+    fn default() -> Self {
+        Self {
+            region: None,
+            endpoint_url: None,
+            profile_name: None,
+            access_secret_session_tuple: None,
+            read_timeout_secs: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
+
+/// Configuration for retry behavior (max retries, strategy, and which client status codes to retry)
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    pub max_retries: usize,
+    pub retry_strategy: RetryStrategy,
+    /// HTTP status codes treated as retriable client errors (default: 400, 403, 408, 429)
+    pub retriable_client_status_codes: Vec<u16>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            retry_strategy: RetryStrategy::default(),
+            retriable_client_status_codes: DEFAULT_RETRIABLE_CLIENT_STATUS_CODES.to_vec(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ObjectInfo {
@@ -78,7 +117,7 @@ pub enum S3Error {
     #[error("{} [FieldNotExist]", .0)]
     FieldNotExist(&'static str),
     #[error("{} [RuntimeError]", .0)]
-    RuntimeError(&'static str),
+    RuntimeError(String),
 }
 
 impl From<std::io::Error> for S3Error {
@@ -87,7 +126,11 @@ impl From<std::io::Error> for S3Error {
     }
 }
 
-fn map_sdk_error<E>(context: String, e: SdkError<E>) -> S3Error
+fn map_sdk_error<E>(
+    context: String,
+    retriable_client_status_codes: &[u16],
+    e: SdkError<E>,
+) -> S3Error
 where
     AWSS3Error: From<SdkError<E>>,
     E: ProvideErrorMetadata + std::fmt::Debug,
@@ -137,7 +180,7 @@ where
             let status_code = service_error.raw().status().as_u16();
             debug!("[ServiceError] status_code {}", status_code);
 
-            if RETRIABLE_CLIENT_STATUS_CODES.contains(&status_code) {
+            if retriable_client_status_codes.contains(&status_code) {
                 S3Error::RetriableClientError(context, e.into(), error_meta, status_code)
             } else if error_meta.code() == Some("SlowDown") {
                 S3Error::RetriableClientError(context, e.into(), error_meta, status_code)
@@ -188,92 +231,68 @@ pub type Result<T> = std::result::Result<T, S3Error>;
 #[derive(Debug, Clone)]
 pub struct S3Client {
     client: AWSS3Client,
-    retry_strategy: RetryStrategy,
-    max_retries: usize,
+    retry_config: RetryConfig,
 }
 
 impl S3Client {
-    pub async fn new(
-        region: Option<String>,
-        endpoint_url: Option<String>,
-        profile_name: Option<String>,
-        access_secret_session_tuple: Option<(String, String, Option<String>)>,
-        read_timeout_secs: Option<u64>,
-        retry_strategy: Option<RetryStrategy>,
-        max_retries: Option<usize>,
-    ) -> Self {
+    /// Build an S3 client. Use [`RetryConfig::default`] for default AWS client retry behavior (no high-level retries from this crate).
+    pub async fn new(config: S3ClientConfig, retry_config: RetryConfig) -> Self {
         let mut config_loader = aws_config::from_env();
-        if let Some(region) = region {
-            config_loader = config_loader.region(Region::new(region))
+        if let Some(region) = &config.region {
+            config_loader = config_loader.region(Region::new(region.clone()))
         }
 
-        if let Some(endpoint_url) = endpoint_url {
+        if let Some(endpoint_url) = &config.endpoint_url {
             config_loader = config_loader.endpoint_url(endpoint_url);
         }
 
-        if let Some(profile_name) = profile_name {
+        if let Some(profile_name) = &config.profile_name {
             config_loader = config_loader.profile_name(profile_name);
         }
-        if let Some((access_key, secret_key, session_token)) = access_secret_session_tuple {
+        if let Some((access_key, secret_key, session_token)) = &config.access_secret_session_tuple {
             config_loader = config_loader.credentials_provider(Credentials::from_keys(
-                access_key,
-                secret_key,
-                session_token,
+                access_key.clone(),
+                secret_key.clone(),
+                session_token.clone(),
             ));
         }
 
         config_loader = config_loader.timeout_config(
-            TimeoutConfig::builder()
-                .read_timeout(Duration::from_secs(
-                    read_timeout_secs.unwrap_or(DEFAULT_READ_TIMEOUT),
-                ))
+            aws_config::timeout::TimeoutConfig::builder()
+                .read_timeout(Duration::from_secs(config.read_timeout_secs))
                 .build(),
         );
 
         // if enrolling into high-level retries, disable low-level retries
-        if max_retries.is_some_and(|x| x > 0) {
-            config_loader = config_loader.retry_config(RetryConfig::disabled())
+        if retry_config.max_retries > 0 {
+            config_loader = config_loader.retry_config(aws_config::retry::RetryConfig::disabled())
         }
 
         let sdk_config = config_loader.load().await;
         let mut config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
         if sdk_config.region().is_none() {
             info!(
-                "Can't resolve region. Using default region: {}",
-                DEFAULT_REGION
+                "Can't resolve region. Using fallback region: {}",
+                FALLBACK_REGION
             );
-            config_builder = config_builder.region(Region::new(DEFAULT_REGION));
+            config_builder = config_builder.region(Region::new(FALLBACK_REGION));
         }
         config_builder = config_builder.force_path_style(true); // this allows http://minio:11000 style endpoint_url
 
         S3Client {
             client: AWSS3Client::from_conf(config_builder.build()),
-            retry_strategy: retry_strategy.unwrap_or(RetryStrategy::ExponentialBackoff(
-                ExponentialBackoff::from_millis(2)
-                    .factor(100)
-                    .max_delay(Duration::from_secs(20)),
-            )),
-            max_retries: max_retries.unwrap_or(0),
+            retry_config,
         }
     }
 
-    pub fn new_with_aws_s3_client(
-        aws_s3_client: AWSS3Client,
-        retry_strategy: Option<RetryStrategy>,
-        max_retries: Option<usize>,
-    ) -> Self {
-        if max_retries.is_some_and(|x| x > 0) && aws_s3_client.config().retry_config().is_some() {
-            warn!("High-level retries enabled but low-level retries are also enabled.");
+    pub fn new_with_aws_s3_client(aws_s3_client: AWSS3Client, retry_config: RetryConfig) -> Self {
+        if retry_config.max_retries > 0 && aws_s3_client.config().retry_config().is_some() {
+            warn!("High-level retries are enabled but low-level retries are also enabled.");
         }
 
         S3Client {
             client: aws_s3_client,
-            retry_strategy: retry_strategy.unwrap_or(RetryStrategy::ExponentialBackoff(
-                ExponentialBackoff::from_millis(2)
-                    .factor(100)
-                    .max_delay(Duration::from_secs(20)),
-            )),
-            max_retries: max_retries.unwrap_or(0),
+            retry_config,
         }
     }
 
@@ -296,7 +315,7 @@ impl S3Client {
         while let Some(item) = pagination_stream
             .try_next()
             .await
-            .map_err(partial!(map_sdk_error => format!("<list_objects_v2_paginate> bucket={bucket} prefix={prefix}"), _))?
+            .map_err(partial!(map_sdk_error => format!("<list_objects_v2_paginate> bucket={bucket} prefix={prefix}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?
         {
             item.contents().into_iter().try_for_each(|object| {
                 objects.push(ObjectInfo {
@@ -343,10 +362,10 @@ impl S3Client {
         delimiter: Option<&str>,
     ) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
         let (objects, common_prefixes) = RetryIf::spawn(
-            self.retry_strategy
+            self.retry_config
+                .retry_strategy
                 .clone()
-                .map(jitter)
-                .take(self.max_retries),
+                .delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 self._list_objects_v2_paginate(bucket, prefix, delimiter)
                     .await
@@ -367,7 +386,7 @@ impl S3Client {
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
         let resp = RetryIf::spawn(
-            self.retry_strategy.clone().map(jitter).take(self.max_retries),
+            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 self
                     .client
@@ -376,7 +395,7 @@ impl S3Client {
                     .key(key)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<head_object> bucket={bucket} key={key}"), _))
+                    .map_err(partial!(map_sdk_error => format!("<head_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
                     .map_err(|e| e.into())
             },
             should_retry,
@@ -433,7 +452,7 @@ impl S3Client {
         }
 
         let resp = builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<get_object> bucket={bucket} key={key}"), _),
+            partial!(map_sdk_error => format!("<get_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
         )?;
 
         let object_info = ObjectInfo {
@@ -475,10 +494,10 @@ impl S3Client {
         start_end_offsets: Option<(usize, usize)>,
     ) -> Result<(ObjectInfo, Vec<u8>)> {
         let (object_info, content) = RetryIf::spawn(
-            self.retry_strategy
+            self.retry_config
+                .retry_strategy
                 .clone()
-                .map(jitter)
-                .take(self.max_retries),
+                .delay_iterator_with_jitter(self.retry_config.max_retries),
             || async { self._get_object(bucket, key, start_end_offsets).await },
             should_retry,
         )
@@ -513,7 +532,7 @@ impl S3Client {
         }
 
         let mut resp = builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<download_object> bucket={bucket} key={key}"), _),
+            partial!(map_sdk_error => format!("<download_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
         )?;
 
         let object_info = ObjectInfo {
@@ -575,10 +594,10 @@ impl S3Client {
         start_end_offsets: Option<(usize, usize)>,
     ) -> Result<ObjectInfo> {
         let obj = RetryIf::spawn(
-            self.retry_strategy
+            self.retry_config
+                .retry_strategy
                 .clone()
-                .map(jitter)
-                .take(self.max_retries),
+                .delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 self._download_object(bucket, key, local_path, start_end_offsets)
                     .await
@@ -608,7 +627,7 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key}"), _))?;
+            .map_err(partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
 
         let file_size = resp
             .content_length()
@@ -660,8 +679,12 @@ impl S3Client {
         let sem = Arc::new(Semaphore::new(n_downloaders.unwrap_or(1)));
         let mut join_set = tokio::task::JoinSet::new();
         for chunk_index in 0..chunk_count {
-            let retry_strategy = self.retry_strategy.clone();
-            let max_retries = self.max_retries;
+            let retry_iterator = self
+                .retry_config
+                .retry_strategy
+                .clone()
+                .delay_iterator_with_jitter(self.retry_config.max_retries);
+            let retriable = self.retry_config.retriable_client_status_codes.clone();
             let client = self.client.clone();
             let local_path_tmp = local_path_tmp_.clone();
             let bucket = bucket.to_string();
@@ -682,7 +705,7 @@ impl S3Client {
                 let end_offset = start_offset + this_chunk;
 
                 RetryIf::spawn(
-                    retry_strategy.clone().map(jitter).take(max_retries),
+                    retry_iterator,
                     || async {
                         // end_offset is provided exclusive but the "end" of "bytes=start,end" is inclusive
                         let range = format!("bytes={}-{}", start_offset, end_offset - 1);
@@ -694,7 +717,7 @@ impl S3Client {
                             .range(range)
                             .send()
                             .await.map_err(
-                                partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _),
+                                partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), retriable.as_slice(), _),
                             )?;
                         debug!("Done getting chunk {}", chunk_index);
 
@@ -741,9 +764,9 @@ impl S3Client {
                 }
             } else {
                 // canceled
-                res_ = Err(S3Error::RuntimeError(
-                    "Multipart download of {local_path} was canceled!",
-                ));
+                res_ = Err(S3Error::RuntimeError(format!(
+                    "Multipart download of {local_path} was canceled!"
+                )));
                 break;
             }
         }
@@ -790,7 +813,7 @@ impl S3Client {
         }
 
         builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<put_object> bucket={bucket} key={key}"), _),
+            partial!(map_sdk_error => format!("<put_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
         )?;
 
         Ok(())
@@ -805,10 +828,10 @@ impl S3Client {
     ) -> Result<()> {
         let content = Bytes::from(content.to_vec());
         RetryIf::spawn(
-            self.retry_strategy
+            self.retry_config
+                .retry_strategy
                 .clone()
-                .map(jitter)
-                .take(self.max_retries),
+                .delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 self._put_object(bucket, key, content.clone(), storage_class)
                     .await
@@ -844,7 +867,7 @@ impl S3Client {
         }
 
         builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<upload_object> bucket={bucket} key={key}"), _),
+            partial!(map_sdk_error => format!("<upload_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
         )?;
 
         Ok(())
@@ -858,10 +881,10 @@ impl S3Client {
         storage_class: Option<&str>,
     ) -> Result<()> {
         RetryIf::spawn(
-            self.retry_strategy
+            self.retry_config
+                .retry_strategy
                 .clone()
-                .map(jitter)
-                .take(self.max_retries),
+                .delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 self._upload_object(bucket, key, local_path, storage_class)
                     .await
@@ -893,10 +916,7 @@ impl S3Client {
 
         // create the multipart upload
         let create_multipart_upload_output = RetryIf::spawn(
-            self.retry_strategy
-                .clone()
-                .map(jitter)
-                .take(self.max_retries),
+            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 let mut builder = self
                     .client
@@ -911,7 +931,7 @@ impl S3Client {
                 builder
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), _))
+                    .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
                     .map_err(|e| e.into())
             },
             should_retry,
@@ -942,8 +962,12 @@ impl S3Client {
         let sem = Arc::new(Semaphore::new(n_uploaders.unwrap_or(1)));
         let mut join_set = tokio::task::JoinSet::new();
         for chunk_index in 0..chunk_count {
-            let retry_strategy = self.retry_strategy.clone();
-            let max_retries = self.max_retries;
+            let retry_iterator = self
+                .retry_config
+                .retry_strategy
+                .clone()
+                .delay_iterator_with_jitter(self.retry_config.max_retries);
+            let retriable = self.retry_config.retriable_client_status_codes.clone();
             let client = self.client.clone();
             let local_path = local_path.to_string();
             let bucket = bucket.to_string();
@@ -962,10 +986,7 @@ impl S3Client {
                 };
 
                 let (part_number, upload_part_output) = RetryIf::spawn(
-                    retry_strategy
-                        .clone()
-                        .map(jitter)
-                        .take(max_retries),
+                    retry_iterator,
                     || async {
 
                     let body = ByteStream::read_from()
@@ -988,7 +1009,7 @@ impl S3Client {
                         .send()
                         .await
                         .map_err(
-                            partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), _),
+                            partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), retriable.as_slice(), _),
                         )?;
                         Ok((part_number, upload_part_output))
                     },
@@ -1029,9 +1050,9 @@ impl S3Client {
                 }
             } else {
                 // canceled
-                res_ = Err(S3Error::RuntimeError(
-                    "Multipart upload of {local_path} was canceled!",
-                ));
+                res_ = Err(S3Error::RuntimeError(format!(
+                    "Multipart upload of {local_path} was canceled!"
+                )));
                 break;
             }
         }
@@ -1045,7 +1066,7 @@ impl S3Client {
                 .upload_id(upload_id)
                 .send()
                 .await
-                .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), _));
+                .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _));
         };
 
         // in case of any error with early loop break
@@ -1059,7 +1080,9 @@ impl S3Client {
         if upload_parts.len() != chunk_count as usize {
             error!("<upload_object_multipart> bucket={bucket} key={key} Chunk count not lined up! Abort multipart upload.");
             abort().await;
-            return Err(S3Error::RuntimeError("Failed to upload all parts!"));
+            return Err(S3Error::RuntimeError(
+                "Failed to upload all parts!".to_string(),
+            ));
         }
 
         // sort by part number
@@ -1069,10 +1092,7 @@ impl S3Client {
         let client = self.client.clone();
         let upload_parts_ref = &upload_parts;
         let complete_multipart_upload_res = RetryIf::spawn(
-            self.retry_strategy
-                .clone()
-                .map(jitter)
-                .take(self.max_retries),
+            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 let complete_multipart_upload_output = client
                     .complete_multipart_upload()
@@ -1086,7 +1106,7 @@ impl S3Client {
                     .upload_id(upload_id)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), _))?;
+                    .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
                 Ok(complete_multipart_upload_output)
             },
             should_retry,
@@ -1108,7 +1128,7 @@ impl S3Client {
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         RetryIf::spawn(
-            self.retry_strategy.clone().map(jitter).take(self.max_retries),
+            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 self
                     .client
@@ -1117,7 +1137,7 @@ impl S3Client {
                     .key(key)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<delete_object> bucket={bucket} key={key}"), _))
+                    .map_err(partial!(map_sdk_error => format!("<delete_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
                     .map_err(|e| e.into())
             },
             should_retry,
@@ -1137,7 +1157,7 @@ impl S3Client {
         storage_class: Option<&str>,
     ) -> Result<()> {
         RetryIf::spawn(
-            self.retry_strategy.clone().map(jitter).take(self.max_retries),
+            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 let mut builder = self.client
                     .copy_object()
@@ -1153,7 +1173,7 @@ impl S3Client {
                 builder
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<copy_object> src_bucket={src_bucket} src_key={src_key} dest_bucket={dest_bucket} dest_key={dest_key} storage_class={:?}", storage_class), _))
+                    .map_err(partial!(map_sdk_error => format!("<copy_object> src_bucket={src_bucket} src_key={src_key} dest_bucket={dest_bucket} dest_key={dest_key} storage_class={:?}", storage_class), self.retry_config.retriable_client_status_codes.as_slice(), _))
                     .map_err(|e| e.into())
             },
             should_retry,
@@ -1180,7 +1200,7 @@ impl S3Client {
         tier: &str,
     ) -> Result<()> {
         RetryIf::spawn(
-            self.retry_strategy.clone().map(jitter).take(self.max_retries),
+            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
             || async {
                 let restore_request = RestoreRequest::builder().days(days).glacier_job_parameters(
                     GlacierJobParameters::builder().tier(Tier::from(tier)).build().map_err(|e| S3Error::ValidationError(e.to_string()))?
@@ -1192,7 +1212,7 @@ impl S3Client {
                     .restore_request(restore_request)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={:?}", tier), _))
+                    .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={:?}", tier), self.retry_config.retriable_client_status_codes.as_slice(), _))
                     .map_err(|e| e.into())
             },
             should_retry,
