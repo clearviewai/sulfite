@@ -146,7 +146,6 @@ pub async fn run_by_csv(
                                     &key,
                                     &local_path,
                                     Some(n_inner_workers),
-                                    None,
                                 )
                                 .await
                         };
@@ -208,7 +207,6 @@ pub async fn run_by_csv(
                                     &key,
                                     &local_path,
                                     Some(n_inner_workers),
-                                    None,
                                 )
                                 .await
                         };
@@ -269,7 +267,6 @@ pub async fn run_by_csv(
                                     &local_path,
                                     Some(n_inner_workers),
                                     storage_class.as_deref(),
-                                    None,
                                 )
                                 .await
                         };

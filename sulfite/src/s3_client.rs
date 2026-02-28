@@ -4,6 +4,7 @@ use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     error::{ErrorMetadata, ProvideErrorMetadata, SdkError},
+    operation::list_objects_v2::ListObjectsV2Output,
     primitives::{ByteStream, ByteStreamError, DateTime, Length},
     types::{
         CompletedMultipartUpload, CompletedPart, GlacierJobParameters, RestoreRequest,
@@ -86,6 +87,129 @@ pub struct ObjectInfo {
 #[derive(Clone, Debug)]
 pub struct CommonPrefixInfo {
     pub prefix: String,
+}
+
+/// Page-by-page iterator for list_objects_v2. Yields one page at a time; retries are applied
+/// per page request, so a failure on one page does not invalidate the iterator.
+///
+/// Uses `Option<Option<String>>` for continuation: `None` = first request not yet made,
+/// `Some(None)` = no more pages, `Some(Some(token))` = use token for next request.
+pub struct ListObjectsV2PageIter<'a> {
+    s3_client: &'a S3Client,
+    bucket: &'a str,
+    prefix: &'a str,
+    delimiter: Option<&'a str>,
+    /// None = first page not fetched; Some(None) = exhausted; Some(Some(t)) = next token
+    continuation_token: Option<Option<String>>,
+}
+
+impl<'a> ListObjectsV2PageIter<'a> {
+    /// Fetches the next page. Returns `Ok(None)` when there are no more pages.
+    /// Retries (using the client's retry config) are applied to this single page request only.
+    pub async fn next_page(&mut self) -> Result<Option<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)>> {
+        if let Some(None) = self.continuation_token {
+            return Ok(None);
+        }
+
+        let s3_client = self.s3_client;
+        let resp = RetryIf::spawn(
+            s3_client
+                .retry_config
+                .retry_strategy
+                .clone()
+                .delay_iterator_with_jitter(s3_client.retry_config.max_retries),
+            || async {
+                let mut builder = s3_client
+                    .client
+                    .list_objects_v2()
+                    .bucket(self.bucket)
+                    .prefix(self.prefix);
+                if let Some(d) = self.delimiter {
+                    builder = builder.delimiter(d);
+                }
+                if let Some(Some(t)) = &self.continuation_token {
+                    builder = builder.continuation_token(t);
+                }
+                builder.send().await.map_err(|e| {
+                    map_sdk_error(
+                        format!(
+                            "<list_objects_v2_paginate_pages> bucket={} prefix={}",
+                            self.bucket, self.prefix
+                        ),
+                        s3_client
+                            .retry_config
+                            .retriable_client_status_codes
+                            .as_slice(),
+                        e,
+                    )
+                })
+            },
+            should_retry,
+        )
+        .await?;
+
+        let more = resp.is_truncated() == Some(true)
+            && resp
+                .next_continuation_token()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+        self.continuation_token = Some(if more {
+            resp.next_continuation_token().map(String::from)
+        } else {
+            None
+        });
+
+        Ok(Some(page_to_object_and_prefix_lists(&resp)?))
+    }
+}
+
+/// Converts one SDK list_objects_v2 page into `(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)`.
+fn page_to_object_and_prefix_lists(
+    item: &ListObjectsV2Output,
+) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
+    let mut objects: Vec<ObjectInfo> = vec![];
+    let mut common_prefixes: Vec<CommonPrefixInfo> = vec![];
+    item.contents().into_iter().try_for_each(|object| {
+        objects.push(ObjectInfo {
+            key: object.key().ok_or(S3Error::FieldNotExist("key"))?.into(),
+            size: object.size().ok_or(S3Error::FieldNotExist("size"))? as u64,
+            timestamp: object
+                .last_modified()
+                .ok_or(S3Error::FieldNotExist("timestamp"))?
+                .to_owned(),
+            storage_class: object.storage_class().map(|sc| sc.as_str().to_owned()),
+            restore_status: object.restore_status().map(|rs| {
+                let is_restoring = if let Some(is_restoring) = rs.is_restore_in_progress {
+                    if is_restoring {
+                        "Restoring"
+                    } else {
+                        "Restored"
+                    }
+                } else {
+                    "N/A"
+                };
+                let ts = rs.restore_expiry_date().map(|red| red.to_string());
+                format!(
+                    "{} (Expires: {})",
+                    is_restoring,
+                    ts.unwrap_or("N/A".to_owned())
+                )
+            }),
+        });
+        Result::Ok(())
+    })?;
+    item.common_prefixes()
+        .into_iter()
+        .try_for_each(|common_prefix| {
+            common_prefixes.push(CommonPrefixInfo {
+                prefix: common_prefix
+                    .prefix()
+                    .ok_or(S3Error::FieldNotExist("prefix"))?
+                    .into(),
+            });
+            Result::Ok(())
+        })?;
+    Ok((objects, common_prefixes))
 }
 
 #[derive(Error, Debug)]
@@ -317,40 +441,9 @@ impl S3Client {
             .await
             .map_err(partial!(map_sdk_error => format!("<list_objects_v2_paginate> bucket={bucket} prefix={prefix}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?
         {
-            item.contents().into_iter().try_for_each(|object| {
-                objects.push(ObjectInfo {
-                    key: object.key().ok_or(S3Error::FieldNotExist("key"))?.into(),
-                    size: object.size().ok_or(S3Error::FieldNotExist("size"))? as u64,
-                    timestamp: object
-                        .last_modified()
-                        .ok_or(S3Error::FieldNotExist("timestamp"))?.to_owned(),
-                    storage_class: object.storage_class().map(|sc| sc.as_str().to_owned()),
-                    // restore_status is not populated for some reason - we leave the code placeholder for now
-                    restore_status: object.restore_status().map(|rs| {
-                        let is_restoring =
-                        if let Some(is_restoring) = rs.is_restore_in_progress {
-                            if is_restoring {
-                                "Restoring"
-                            } else {
-                                "Restored"
-                            }
-                        } else {
-                            "N/A"
-                        };
-                        let ts = rs.restore_expiry_date().map(|red| red.to_string());
-                        format!("{} (Expires: {})", is_restoring, ts.unwrap_or("N/A".to_owned()))
-                    }),
-                });
-                Result::Ok(())
-            })?;
-            item.common_prefixes()
-                .into_iter()
-                .try_for_each(|common_prefix| {
-                    common_prefixes.push(CommonPrefixInfo {
-                        prefix: common_prefix.prefix().ok_or(S3Error::FieldNotExist("prefix"))?.into(),
-                    });
-                    Result::Ok(())
-                })?;
+            let (mut objs, mut prefixes) = page_to_object_and_prefix_lists(&item)?;
+            objects.append(&mut objs);
+            common_prefixes.append(&mut prefixes);
         }
         Ok((objects, common_prefixes))
     }
@@ -382,6 +475,24 @@ impl S3Client {
         );
 
         Ok((objects, common_prefixes))
+    }
+
+    /// Returns an iterator that yields one list_objects_v2 page at a time. Retries are applied
+    /// per page request (each call to `next_page()`), so the iterator is not invalidated by
+    /// a transient failure on one page.
+    pub fn list_objects_v2_page_iter<'a>(
+        &'a self,
+        bucket: &'a str,
+        prefix: &'a str,
+        delimiter: Option<&'a str>,
+    ) -> ListObjectsV2PageIter<'a> {
+        ListObjectsV2PageIter {
+            s3_client: self,
+            bucket,
+            prefix,
+            delimiter,
+            continuation_token: None,
+        }
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
@@ -617,7 +728,6 @@ impl S3Client {
         key: &str,
         local_path: &str,
         n_downloaders: Option<usize>,
-        pb: Option<&indicatif::ProgressBar>,
     ) -> Result<ObjectInfo> {
         // head first
         let resp = self
@@ -668,7 +778,6 @@ impl S3Client {
             chunk_count -= 1;
         }
         debug!("Chunk count: {}", chunk_count);
-        pb.map(|pb| pb.set_length(chunk_count as u64));
 
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
@@ -689,7 +798,6 @@ impl S3Client {
             let local_path_tmp = local_path_tmp_.clone();
             let bucket = bucket.to_string();
             let key = key.to_string();
-            let pb = pb.map(|pb| pb.clone());
 
             let permit = Arc::clone(&sem).acquire_owned().await;
             join_set.spawn(async move {
@@ -745,9 +853,6 @@ impl S3Client {
                 )
                 .await?;
 
-                pb.map(|pb| {
-                    pb.inc(1);
-                });
                 Ok(())
             });
         }
@@ -905,7 +1010,6 @@ impl S3Client {
         local_path: &str,
         n_uploaders: Option<usize>,
         storage_class: Option<&str>,
-        pb: Option<&indicatif::ProgressBar>,
     ) -> Result<()> {
         let file_size = tokio::fs::metadata(local_path).await?.len();
         if file_size == 0 {
@@ -956,7 +1060,6 @@ impl S3Client {
             chunk_count -= 1;
         }
         debug!("Chunk count: {}", chunk_count);
-        pb.map(|pb| pb.set_length(chunk_count as u64));
 
         // parallel upload
         let sem = Arc::new(Semaphore::new(n_uploaders.unwrap_or(1)));
@@ -973,7 +1076,6 @@ impl S3Client {
             let bucket = bucket.to_string();
             let key = key.to_string();
             let upload_id = upload_id.to_string();
-            let pb = pb.map(|pb| pb.clone());
 
             let permit = Arc::clone(&sem).acquire_owned().await;
             join_set.spawn(async move {
@@ -1017,9 +1119,6 @@ impl S3Client {
                 )
                 .await?;
 
-                pb.map(|pb| {
-                    pb.inc(1);
-                });
                 Ok((
                     upload_part_output.e_tag.ok_or(S3Error::FieldNotExist("etag"))?,
                     part_number,

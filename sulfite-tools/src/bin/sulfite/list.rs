@@ -1,6 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
-use sulfite::{RetryConfig, S3Client, S3ClientConfig};
+use sulfite::{ObjectInfo, RetryConfig, S3Client, S3ClientConfig};
 
 use crate::ListArgs;
 
@@ -22,57 +22,75 @@ pub async fn run_list(
     )
     .await;
 
-    // list objects
-    let (objects, common_prefixes) = client
-        .list_objects_v2_paginate(&args.bucket, &args.prefix, args.delimiter.as_deref())
-        .await?;
-
     let prefix = &args.prefix;
     let suffix = &args.suffix;
     let keep_prefix = args.keep_prefix;
     let remove_suffix = args.remove_suffix;
 
-    let objects = objects
-        .into_iter()
-        .filter(|object| object.key.ends_with(suffix))
-        .collect::<Vec<_>>();
+    let mut object_count: usize = 0;
+    let mut head_objects: Vec<ObjectInfo> = Vec::new();
+    let mut common_prefixes = Vec::new();
 
-    if let Some(output_path) = args.output_path {
-        let mut writer = csv::Writer::from_path(output_path)?;
-        writer.write_record(&["key", "size", "timestamp", "storage_class"])?; // write header
-        objects.iter().for_each(|object| {
-            let mut key = object.key.clone();
-            if !keep_prefix {
-                key = key.replace(prefix, "");
+    let mut writer = match &args.output_path {
+        Some(p) => {
+            let mut w = csv::Writer::from_path(p)?;
+            w.write_record(&["key", "size", "timestamp", "storage_class"])?;
+            Some(w)
+        }
+        None => None,
+    };
+
+    let mut pages = client.list_objects_v2_page_iter(
+        &args.bucket,
+        &args.prefix,
+        args.delimiter.as_deref(),
+    );
+
+    while let Some((objs, mut prefixes)) = pages.next_page().await? {
+        common_prefixes.append(&mut prefixes);
+        for object in objs {
+            if !object.key.ends_with(suffix) {
+                continue;
             }
-            if remove_suffix {
-                key = key.replace(suffix, "");
-            }
-            writer
-                .write_record(&[
+            object_count += 1;
+            if let Some(w) = &mut writer {
+                let mut key = object.key.clone();
+                if !keep_prefix {
+                    key = key.replace(prefix, "");
+                }
+                if remove_suffix {
+                    key = key.replace(suffix, "");
+                }
+                let _ = w.write_record(&[
                     key.as_str(),
                     object.size.to_string().as_str(),
                     object.timestamp.to_string().as_str(),
-                    object.storage_class.as_ref().unwrap(),
-                ])
-                .unwrap();
-        });
-        writer.flush()?;
+                    object.storage_class.as_deref().unwrap_or(""),
+                ]);
+            }
+            if head_objects.len() < args.head {
+                head_objects.push(object);
+            }
+        }
     }
 
-    println!("{}", format!("Found {} objects.", objects.len()).bold());
-    if !objects.is_empty() {
+    if let Some(w) = &mut writer {
+        w.flush()?;
+    }
+
+    println!("{}", format!("Found {} objects.", object_count).bold());
+    if !head_objects.is_empty() {
         println!(
             "{}",
             format!(
                 "Listing first {}...",
-                std::cmp::min(args.head, objects.len())
+                std::cmp::min(args.head, head_objects.len())
             )
             .italic()
             .underline()
         );
     }
-    objects.iter().take(args.head).for_each(|object| {
+    head_objects.iter().for_each(|object| {
         println!("  {}", object.key.replace(prefix, "").bold());
         println!(
             "    {} {} {} {} {} {}",
@@ -81,7 +99,7 @@ pub async fn run_list(
             "timestamp:".blue(),
             object.timestamp,
             "storage_class:".blue(),
-            object.storage_class.as_ref().unwrap()
+            object.storage_class.as_deref().unwrap_or("")
         );
     });
 

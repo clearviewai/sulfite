@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use sulfite::{RetryConfig, S3Client, S3ClientConfig};
-use sulfite_tools::utils::make_progress_bar;
 
 use crate::OpArgs;
 
@@ -51,17 +50,14 @@ pub async fn run_op(
                     .and_then(|os_str| os_str.to_str())
                     .context("can't convert")?,
             };
-            let pb = make_progress_bar(Some(0));
             client
                 .download_object_multipart(
                     &args.bucket,
                     &args.key,
                     local_path,
                     Some(args.n_workers),
-                    Some(&pb),
                 )
                 .await?;
-            pb.finish();
         }
         "upload" => {
             let Some(local_path) = &args.local_path else {
@@ -80,7 +76,6 @@ pub async fn run_op(
             let Some(local_path) = &args.local_path else {
                 bail!("local_path is required!");
             };
-            let pb = make_progress_bar(Some(0));
             client
                 .upload_object_multipart(
                     &args.bucket,
@@ -88,10 +83,8 @@ pub async fn run_op(
                     local_path,
                     Some(args.n_workers),
                     args.storage_class.as_deref(),
-                    Some(&pb),
                 )
                 .await?;
-            pb.finish();
         }
         "delete" => {
             client.delete_object(&args.bucket, &args.key).await?;
