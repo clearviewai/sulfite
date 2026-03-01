@@ -1,19 +1,24 @@
 [package]
 name = "sulfite-tools"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 authors = ["Terence Liu <terence.liu@clearview.ai>"]
 description = "A high-level S3 client built on AWS SDK for Rust for bandwidth saturation (CLI tools)"
 license = "MIT"
 homepage = "https://github.com/clearviewai/sulfite"
 repository = "https://github.com/clearviewai/sulfite"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["s3", "object", "storage"]
 categories = ["web-programming::http-client"]
 
+# Exclude binary from `cargo doc` so it does not overwrite the sulfite library docs (same output path).
+[[bin]]
+name = "sulfite"
+doc = false
+
 [dependencies]
 # Path used for local dev; when published, only version is used (publish sulfite first).
-sulfite = { version = "0.0.4", path = "../sulfite" }
+sulfite = { version = "0.0.5", path = "../sulfite" }
 
 anyhow = "1.0"
 env_logger = "0.11"

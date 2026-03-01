@@ -1,4 +1,4 @@
-#![doc = include_str!(concat!(env!("OUT_DIR"), "/README.md"))]
+#![doc = include_str!("../README.md")]
 
 mod retry_strategy;
 mod s3_client;

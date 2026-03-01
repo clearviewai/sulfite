@@ -1,4 +1,10 @@
-# sulfite
+# sulfite-tools
+
+[![Crates.io](https://img.shields.io/crates/v/sulfite-tools)](https://crates.io/crates/sulfite-tools)
+[![Docs.rs](https://docs.rs/sulfite-tools/badge.svg)](https://docs.rs/sulfite-tools)
+[![License](https://img.shields.io/crates/l/sulfite-tools)](#license)
+
+CLI for S3 built on the [sulfite](https://crates.io/crates/sulfite) library. Supports listing, single-object ops, and batch ops from CSV.
 
 ## Overview
 
@@ -6,30 +12,13 @@
 
 *The name*: `SO3^2-`, an anion, implying a companion to some other cation (application), is commonly used as a preservative in wines and dried fruits (preserve to S3). It's `S3` with an `O` in the middle, a play on [oxidization](https://wiki.mozilla.org/Oxidation).
 
-## Motivation
-
-The AWS SDK is a little low-level for users to take advantage of the concurrency & parallelism, with the following challenges:
-
-1. You need to orchestrate the parallel multipart download & upload for large files.
-2. The built-in retry settings are too basic (limited to HTTP status codes, none for bytestream errors), and we allow installing higher-level retries.
-3. The async API doesn't agree well with the filesystem for high-throughput operations, when it comes to streaming small chunks from/to disk.
-
-To address them, we provide implementations for the parallel multipart download & upload, and higher-level retries. We also make sure the on-disk file is adequately buffered to avoid async-sync overhead.
-
-## Crates
-
-Workspace for the sulfite S3 ecosystem:
-
-- **[sulfite](sulfite/)** — High-level S3 client library for Rust ([crates.io](https://crates.io/crates/sulfite) \| [docs.rs](https://docs.rs/sulfite))
-- **[sulfite-tools](sulfite-tools/)** — CLI for S3 (list, single-object ops, batch ops from CSV) ([crates.io](https://crates.io/crates/sulfite-tools) \| [docs.rs](https://docs.rs/sulfite-tools))
-
-## CLI Installation
+## Installation
 
 ```bash
 cargo install sulfite-tools
 ```
 
-## CLI Usage
+## Usage
 
 Global options (can be used with any subcommand):
 
@@ -92,6 +81,3 @@ Use `-c/--column-idx N` if the key column is not the first (0-based index).
 **Archival and small files** — When you specify an archival storage class (e.g. `--storage-class GLACIER`) on `csv upload` or `csv copy`, objects under 16 KB are stored as STANDARD instead of the requested class, for efficiency.
 
 Run `sulfite --help` or `sulfite <command> --help` for full options.
-
-## License
-This project is licensed under the MIT license.
