@@ -1,35 +1,20 @@
-use anyhow::Result;
 use colored::Colorize;
-use sulfite::{ObjectInfo, RetryConfig, S3Client, S3ClientConfig};
+use sulfite::S3Client;
+use sulfite_tools::utils::warn_prefix_no_trailing_slash;
 
 use crate::ListArgs;
 
-pub async fn run_list(
-    region: &Option<String>,
-    endpoint_url: &Option<String>,
-    args: ListArgs,
-) -> Result<()> {
-    let client = S3Client::new(
-        S3ClientConfig {
-            region: region.clone(),
-            endpoint_url: endpoint_url.clone(),
-            ..Default::default()
-        },
-        RetryConfig {
-            max_retries: 10,
-            ..Default::default()
-        },
-    )
-    .await;
-
+pub async fn run_list(client: S3Client, args: ListArgs) -> anyhow::Result<()> {
+    warn_prefix_no_trailing_slash(&args.prefix, "list");
     let prefix = &args.prefix;
     let suffix = &args.suffix;
     let keep_prefix = args.keep_prefix;
     let remove_suffix = args.remove_suffix;
 
     let mut object_count: usize = 0;
-    let mut head_objects: Vec<ObjectInfo> = Vec::new();
-    let mut common_prefixes = Vec::new();
+    let mut objects_to_display = vec![];
+    let mut prefix_count: usize = 0;
+    let mut prefixes_to_display = vec![];
 
     let mut writer = match &args.output_path {
         Some(p) => {
@@ -40,36 +25,46 @@ pub async fn run_list(
         None => None,
     };
 
-    let mut pages = client.list_objects_v2_page_iter(
-        &args.bucket,
-        &args.prefix,
-        args.delimiter.as_deref(),
-    );
+    let mut pages =
+        client.list_objects_v2_page_iter(&args.bucket, &args.prefix, Some(args.delimiter.as_str()));
 
-    while let Some((objs, mut prefixes)) = pages.next_page().await? {
-        common_prefixes.append(&mut prefixes);
-        for object in objs {
-            if !object.key.ends_with(suffix) {
+    while let Some((objs, prefixes)) = pages.next_page().await? {
+        for obj in objs {
+            if !obj.key.ends_with(suffix) {
                 continue;
             }
             object_count += 1;
             if let Some(w) = &mut writer {
-                let mut key = object.key.clone();
+                let mut key = obj.key.clone();
                 if !keep_prefix {
-                    key = key.replace(prefix, "");
+                    if let Some(s) = key.strip_prefix(prefix.as_str()) {
+                        key = s.to_string();
+                    }
                 }
                 if remove_suffix {
-                    key = key.replace(suffix, "");
+                    if let Some(s) = key.strip_suffix(suffix) {
+                        key = s.to_string();
+                    }
                 }
                 let _ = w.write_record(&[
                     key.as_str(),
-                    object.size.to_string().as_str(),
-                    object.timestamp.to_string().as_str(),
-                    object.storage_class.as_deref().unwrap_or(""),
+                    obj.size.to_string().as_str(),
+                    obj.timestamp.to_string().as_str(),
+                    obj.storage_class.as_deref().unwrap_or(""),
                 ]);
             }
-            if head_objects.len() < args.head {
-                head_objects.push(object);
+            if objects_to_display.len() < args.display_max_entries {
+                objects_to_display.push(obj);
+            }
+        }
+
+        for p in prefixes {
+            if !p.prefix.ends_with(suffix) {
+                continue;
+            }
+            prefix_count += 1;
+            if prefixes_to_display.len() < args.display_max_entries {
+                prefixes_to_display.push(p);
             }
         }
     }
@@ -79,27 +74,44 @@ pub async fn run_list(
     }
 
     println!("{}", format!("Found {} objects.", object_count).bold());
-    if !head_objects.is_empty() {
+    if !objects_to_display.is_empty() {
         println!(
             "{}",
-            format!(
-                "Listing first {}...",
-                std::cmp::min(args.head, head_objects.len())
-            )
-            .italic()
-            .underline()
+            format!("Listing first {}...", objects_to_display.len())
+                .italic()
+                .underline()
         );
     }
-    head_objects.iter().for_each(|object| {
-        println!("  {}", object.key.replace(prefix, "").bold());
+    // Console display always strips the list prefix for readability (keep_prefix only affects CSV output).
+    objects_to_display.iter().for_each(|obj| {
+        if let Some(s) = obj.key.strip_prefix(prefix.as_str()) {
+            println!("  {}", s.to_string().bold());
+        } else {
+            // should never happen
+            println!("  {}", obj.key.bold());
+        }
+        let size_kb = obj.size as f64 / 1024.0;
+        let size_mb = size_kb / 1024.0;
+        let size_gb = size_mb / 1024.0;
+        let size_tb = size_gb / 1024.0;
+        let size_human_str = if size_tb > 1.0 {
+            format!(" ({:.2}T)", size_tb)
+        } else if size_gb > 1.0 {
+            format!(" ({:.2}G)", size_gb)
+        } else if size_mb > 1.0 {
+            format!(" ({:.2}M)", size_mb)
+        } else {
+            format!(" ({:.2}K)", size_kb)
+        };
         println!(
-            "    {} {} {} {} {} {}",
+            "    {} {}{} {} {} {} {}",
             "size:".blue(),
-            object.size,
+            obj.size,
+            size_human_str,
             "timestamp:".blue(),
-            object.timestamp,
+            obj.timestamp,
             "storage_class:".blue(),
-            object.storage_class.as_deref().unwrap_or("")
+            obj.storage_class.as_deref().unwrap_or("")
         );
     });
 
@@ -107,13 +119,23 @@ pub async fn run_list(
 
     println!(
         "{}",
-        format!("Found {} common prefixes.", common_prefixes.len()).bold()
+        format!("Found {} common prefixes.", prefix_count).bold()
     );
-    if !common_prefixes.is_empty() {
-        println!("{}", "Listing...".italic().underline());
+    if !prefixes_to_display.is_empty() {
+        println!(
+            "{}",
+            format!("Listing first {}...", prefixes_to_display.len())
+                .italic()
+                .underline()
+        );
     }
-    common_prefixes.iter().for_each(|common_prefix| {
-        println!("  {}", common_prefix.prefix.replace(prefix, "").bold());
+    prefixes_to_display.iter().for_each(|p| {
+        if let Some(s) = p.prefix.strip_prefix(prefix.as_str()) {
+            println!("  {}", s.to_string().bold());
+        } else {
+            // should never happen
+            println!("  {}", p.prefix.bold());
+        }
     });
 
     Ok(())
