@@ -11,15 +11,6 @@ use sulfite_tools::utils::{
 use crate::{CsvArgs, CsvCommand};
 
 pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
-    let source_path = match &args.command {
-        CsvCommand::Head { source_path, .. }
-        | CsvCommand::Download { source_path, .. }
-        | CsvCommand::Upload { source_path, .. }
-        | CsvCommand::Delete { source_path, .. }
-        | CsvCommand::Copy { source_path, .. }
-        | CsvCommand::Restore { source_path, .. } => source_path.as_str(),
-    };
-
     if let Some(local_dir) = match &args.command {
         CsvCommand::Download { local_dir, .. } => Some(local_dir.clone()),
         _ => None,
@@ -28,7 +19,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
     }
 
     // Keys are streamed (iterator); we do a separate file read for line count so the progress bar can show total. Memory stays O(1) per key.
-    let keys = get_keys_from_csv(source_path, args.column_idx, args.has_header)?;
+    let keys = get_keys_from_csv(&args.source_path, args.column_idx, args.has_header)?;
 
     match &args.command {
         CsvCommand::Head { prefix, .. }
@@ -50,7 +41,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
     let pb = if is_head {
         None
     } else {
-        let total_lines = get_line_count(source_path)? as u64;
+        let total_lines = get_line_count(&args.source_path)? as u64;
         let key_count = total_lines.saturating_sub(if args.has_header { 1 } else { 0 });
         Some(make_progress_bar(Some(key_count)))
     };
@@ -82,7 +73,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                             let key = format!("{prefix}{key}{suffix}");
 
                             let obj = client.head_object(&bucket, &key).await
-                                .with_context(|| format!("object {key} not found"))?;
+                                .with_context(|| format!("heading key {key}"))?;
 
                             // Skip vs override: if local file exists, compare size and mtime (both as SystemTime).
                             // SystemTime is always a UTC instant (duration since epoch); comparison is timezone-safe.
@@ -207,13 +198,24 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                             let src_key = format!("{src_prefix}{key}{src_suffix}");
                             let dst_key = format!("{dst_prefix}{key}{dst_suffix}");
 
-                            let obj = client.head_object(&src_bucket, &src_key).await
-                                .with_context(|| format!("object {src_key} not found on source"))?;
+                            let src_obj = client.head_object(&src_bucket, &src_key).await
+                                .with_context(|| format!("heading key {src_key} on source"))?;
+
+                            // Skip only if src and dst are the same key and src is in archival tier.
+                            // This happens when you idempotently copy an object into the same destination bucket and key with an archival tier storage class.
+                            if let Some(storage_class) = src_obj.storage_class {
+                                if src_key == dst_key && (storage_class == "GLACIER" || storage_class == "DEEP_ARCHIVE") {
+                                    pb.as_ref().map(|pb| {
+                                        pb.set_message(format!("{src_key} is in archival tier. Skipping."));
+                                    });
+                                    return Ok(());
+                                }
+                            }
 
                             // For archival tier, small files should still be STANDARD for efficiency.
                             // Copy path by size: < 16 KB → no storage class (default STANDARD);
                             // >= 16 KB → storage class.
-                            let copy_storage_class = if obj.size < 16 * 1024 {
+                            let copy_storage_class = if src_obj.size < 16 * 1024 {
                                 None
                             } else {
                                 storage_class.as_deref()
@@ -256,6 +258,8 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
             }
         })
         .await;
+
+    pb.as_ref().map(|pb| pb.finish());
 
     Ok(())
 }

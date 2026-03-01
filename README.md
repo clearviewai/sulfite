@@ -80,7 +80,7 @@ Use `list` to write a manifest of keys to a CSV file, then use the `csv` subcomm
 sulfite list -b my-bucket -p my/prefix/ -o manifest.csv
 
 # 2. Download every key in the manifest to a local directory (keys become paths under that dir)
-sulfite csv download manifest.csv --has-header -b my-bucket -p my/prefix/ -l ./downloaded
+sulfite csv manifest.csv --has-header download -b my-bucket -p my/prefix/ -l ./downloaded
 ```
 
 Use `-c/--column-idx N` if the key column is not the first (0-based index).

@@ -38,6 +38,7 @@ pub enum RetryStrategy {
     },
 }
 
+/// Default retry strategy (exponential backoff: 100ms initial, factor 2, max 10s).
 impl Default for RetryStrategy {
     fn default() -> Self {
         RetryStrategy::ExponentialBackoff {

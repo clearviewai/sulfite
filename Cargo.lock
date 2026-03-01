@@ -2169,7 +2169,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sulfite"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "sulfite-tools"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "chrono",

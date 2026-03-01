@@ -216,6 +216,8 @@ pub struct CsvArgs {
     #[command(subcommand)]
     pub command: CsvCommand,
 
+    /// The path to the CSV file.
+    pub source_path: String,
     /// The zero-based column index in the CSV that holds the object key.
     #[arg(short, long, default_value = "0")]
     pub column_idx: usize,
@@ -231,13 +233,11 @@ pub struct CsvArgs {
 pub enum CsvCommand {
     /// Get metadata (HEAD) for each key and print it.
     Head {
-        /// The path to the CSV file.
-        source_path: String,
         /// The name of the S3 bucket.
         #[arg(short, long)]
         bucket: String,
         /// The prefix prepended to each key from the CSV.
-        #[arg(short, long, default_value = "")]
+        #[arg(short, long)]
         prefix: String,
         /// The suffix appended to each key from the CSV.
         #[arg(short, long, default_value = "")]
@@ -245,13 +245,11 @@ pub enum CsvCommand {
     },
     /// Download each key; preserve key path under the local directory.
     Download {
-        /// The path to the CSV file.
-        source_path: String,
         /// The name of the S3 bucket.
         #[arg(short, long)]
         bucket: String,
         /// The prefix prepended to each key from the CSV.
-        #[arg(short, long, default_value = "")]
+        #[arg(short, long)]
         prefix: String,
         /// The suffix appended to each key from the CSV.
         #[arg(short, long, default_value = "")]
@@ -265,13 +263,11 @@ pub enum CsvCommand {
     },
     /// Upload each key from files under the local directory.
     Upload {
-        /// The path to the CSV file.
-        source_path: String,
         /// The name of the S3 bucket.
         #[arg(short, long)]
         bucket: String,
         /// The prefix prepended to each key from the CSV.
-        #[arg(short, long, default_value = "")]
+        #[arg(short, long)]
         prefix: String,
         /// The suffix appended to each key from the CSV.
         #[arg(short, long, default_value = "")]
@@ -288,13 +284,11 @@ pub enum CsvCommand {
     },
     /// Delete each key.
     Delete {
-        /// The path to the CSV file.
-        source_path: String,
         /// The name of the S3 bucket.
         #[arg(short, long)]
         bucket: String,
         /// The prefix prepended to each key from the CSV.
-        #[arg(short, long, default_value = "")]
+        #[arg(short, long)]
         prefix: String,
         /// The suffix appended to each key from the CSV.
         #[arg(short, long, default_value = "")]
@@ -302,13 +296,11 @@ pub enum CsvCommand {
     },
     /// Copy each key from source bucket to destination.
     Copy {
-        /// The path to the CSV file.
-        source_path: String,
         /// The source bucket name.
         #[arg(long)]
         src_bucket: String,
         /// The prefix prepended to each key for the source.
-        #[arg(long, default_value = "")]
+        #[arg(long)]
         src_prefix: String,
         /// The suffix appended to each key for the source.
         #[arg(long, default_value = "")]
@@ -317,7 +309,7 @@ pub enum CsvCommand {
         #[arg(long)]
         dst_bucket: String,
         /// The prefix prepended to each key for the destination.
-        #[arg(long, default_value = "")]
+        #[arg(long)]
         dst_prefix: String,
         /// The suffix appended to each key for the destination.
         #[arg(long, default_value = "")]
@@ -328,13 +320,11 @@ pub enum CsvCommand {
     },
     /// Restore each key from archival storage (e.g. Glacier).
     Restore {
-        /// The path to the CSV file.
-        source_path: String,
         /// The name of the S3 bucket.
         #[arg(short, long)]
         bucket: String,
         /// The prefix prepended to each key from the CSV.
-        #[arg(short, long, default_value = "")]
+        #[arg(short, long)]
         prefix: String,
         /// The suffix appended to each key from the CSV.
         #[arg(short, long, default_value = "")]

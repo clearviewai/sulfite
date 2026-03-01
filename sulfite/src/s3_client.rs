@@ -28,8 +28,9 @@ use tokio_retry::RetryIf;
 
 /// Read timeout in seconds for the underlying HTTP client (boto default).
 const DEFAULT_READ_TIMEOUT: u64 = 60;
-/// HTTP status codes treated as retriable client errors (400, 403, 408, 429).
-const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[400, 403, 408, 429];
+/// HTTP status codes treated as retriable client errors. 408 Request Timeout, 429 Too Many Requests are standard.
+/// Error code SlowDown is also retried.
+const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[408, 429];
 /// Region used when the environment/config does not provide one.
 const FALLBACK_REGION: &str = "us-east-1";
 /// Buffer size for upload byte stream (1 MiB).
@@ -62,15 +63,16 @@ impl Default for S3ClientConfig {
     }
 }
 
-/// Configuration for retry behavior (max retries, strategy, and which client status codes to retry)
+/// Configuration for retry behavior (max retries, strategy, and which client status codes to retry).
+/// Use [`RetryConfig::default`] for default retry behavior (no high-level retries).
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
     pub max_retries: usize,
     pub retry_strategy: RetryStrategy,
-    /// HTTP status codes treated as retriable client errors (default: 400, 403, 408, 429)
     pub retriable_client_status_codes: Vec<u16>,
 }
 
+/// Default retry configuration (max_retries=0, exponential backoff strategy, retriable client status codes: 408, 429).
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
@@ -225,17 +227,17 @@ pub enum S3Error {
     DispatchFailure(String),
     #[error("{} [ResponseError]", .0)]
     ResponseError(String),
-    #[error("{} [RetriableClientError - {} {} {}]", .0, .1, .2, .3)]
+    #[error("{} [RetriableClientError - <{}> <{}> <{}>]", .0, .1, .2, .3)]
     RetriableClientError(String, AWSS3Error, ErrorMetadata, u16),
-    #[error("{} [RetriableServerError - {} {} {}]", .0, .1, .2, .3)]
+    #[error("{} [RetriableServerError - <{}> <{}> <{}>]", .0, .1, .2, .3)]
     RetriableServerError(String, AWSS3Error, ErrorMetadata, u16),
-    #[error("{} [AWSS3Error - {} {} {}]", .0, .1, .2, .3)]
+    #[error("{} [AWSS3Error - <{}> <{}> <{}>]", .0, .1, .2, .3)]
     AWSS3Error(String, AWSS3Error, ErrorMetadata, u16),
-    #[error("{} [OtherSDKError - {}]", .0, .1)]
+    #[error("{} [OtherSDKError - <{}>]", .0, .1)]
     OtherSDKError(String, AWSS3Error),
-    #[error("{} [ByteStreamDownloadError - {}]", .0, .1)]
+    #[error("{} [ByteStreamDownloadError - <{}>]", .0, .1)]
     ByteStreamDownloadError(String, ByteStreamError),
-    #[error("{} [ByteStreamUploadError - {}]", .0, .1)]
+    #[error("{} [ByteStreamUploadError - <{}>]", .0, .1)]
     ByteStreamUploadError(String, ByteStreamError),
     #[error("{} [ValidationError]", .0)]
     ValidationError(String),
@@ -1282,7 +1284,7 @@ impl S3Client {
                 .restore_request(restore_request)
                 .send()
                 .await
-                .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={:?}", tier), self.retry_config.retriable_client_status_codes.as_slice(), _))
+                .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={tier}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
         })
         .await?;
 
