@@ -122,13 +122,8 @@ impl<'a> ListObjectsV2PageIter<'a> {
         }
 
         let s3_client = self.s3_client;
-        let resp = RetryIf::spawn(
-            s3_client
-                .retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(s3_client.retry_config.max_retries),
-            || async {
+        let resp = s3_client
+            .with_retry(|| async {
                 let mut builder = s3_client
                     .client
                     .list_objects_v2()
@@ -153,10 +148,8 @@ impl<'a> ListObjectsV2PageIter<'a> {
                         e,
                     )
                 })
-            },
-            should_retry,
-        )
-        .await?;
+            })
+            .await?;
 
         let more = resp.is_truncated() == Some(true)
             && resp
@@ -433,7 +426,24 @@ impl S3Client {
         }
     }
 
-    async fn _list_objects_v2_paginate(
+    /// Runs an operation with the client's retry policy (strategy + max_retries + should_retry).
+    async fn with_retry<F, Fut, T>(&self, op: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        RetryIf::spawn(
+            self.retry_config
+                .retry_strategy
+                .clone()
+                .delay_iterator_with_jitter(self.retry_config.max_retries),
+            op,
+            should_retry,
+        )
+        .await
+    }
+
+    async fn _list_objects_v2_paginated(
         &self,
         bucket: &str,
         prefix: &str,
@@ -452,7 +462,7 @@ impl S3Client {
         while let Some(item) = pagination_stream
             .try_next()
             .await
-            .map_err(partial!(map_sdk_error => format!("<list_objects_v2_paginate> bucket={bucket} prefix={prefix}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?
+            .map_err(partial!(map_sdk_error => format!("<list_objects_v2_paginated> bucket={bucket} prefix={prefix}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?
         {
             let (mut objs, mut prefixes) = page_to_object_and_prefix_lists(&item)?;
             objects.append(&mut objs);
@@ -461,24 +471,18 @@ impl S3Client {
         Ok((objects, common_prefixes))
     }
 
-    pub async fn list_objects_v2_paginate(
+    pub async fn list_objects_v2_paginated(
         &self,
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
     ) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
-        let (objects, common_prefixes) = RetryIf::spawn(
-            self.retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                self._list_objects_v2_paginate(bucket, prefix, delimiter)
+        let (objects, common_prefixes) = self
+            .with_retry(|| async {
+                self._list_objects_v2_paginated(bucket, prefix, delimiter)
                     .await
-            },
-            should_retry,
-        )
-        .await?;
+            })
+            .await?;
 
         debug!(
             "Prefix {}: Found {} objects and {} common prefixes.",
@@ -509,21 +513,17 @@ impl S3Client {
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
-        let resp = RetryIf::spawn(
-            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                self
-                    .client
+        let resp = self
+            .with_retry(|| async {
+                self.client
                     .head_object()
                     .bucket(bucket)
                     .key(key)
                     .send()
                     .await
                     .map_err(partial!(map_sdk_error => format!("<head_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            },
-            should_retry,
-        )
-        .await?;
+            })
+            .await?;
 
         let object_info = ObjectInfo {
             key: key.into(),
@@ -616,15 +616,9 @@ impl S3Client {
         key: &str,
         start_end_offsets: Option<(usize, usize)>,
     ) -> Result<(ObjectInfo, Vec<u8>)> {
-        let (object_info, content) = RetryIf::spawn(
-            self.retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async { self._get_object(bucket, key, start_end_offsets).await },
-            should_retry,
-        )
-        .await?;
+        let (object_info, content) = self
+            .with_retry(|| async { self._get_object(bucket, key, start_end_offsets).await })
+            .await?;
 
         Ok((object_info, content))
     }
@@ -718,18 +712,12 @@ impl S3Client {
         local_path: &str,
         start_end_offsets: Option<(usize, usize)>,
     ) -> Result<ObjectInfo> {
-        let obj = RetryIf::spawn(
-            self.retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
+        let obj = self
+            .with_retry(|| async {
                 self._download_object(bucket, key, local_path, start_end_offsets)
                     .await
-            },
-            should_retry,
-        )
-        .await?;
+            })
+            .await?;
 
         trace!("Downloaded from s3://{}/{} to {}", bucket, key, local_path);
 
@@ -743,12 +731,8 @@ impl S3Client {
         local_path: &str,
         n_downloaders: Option<usize>,
     ) -> Result<ObjectInfo> {
-        let resp = RetryIf::spawn(
-            self.retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
+        let resp = self
+            .with_retry(|| async {
                 self.client
                     .head_object()
                     .bucket(bucket)
@@ -756,10 +740,8 @@ impl S3Client {
                     .send()
                     .await
                     .map_err(partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            },
-            should_retry,
-        )
-        .await?;
+            })
+            .await?;
 
         let file_size = resp
             .content_length()
@@ -954,17 +936,10 @@ impl S3Client {
         storage_class: Option<&str>,
     ) -> Result<()> {
         let content = Bytes::from(content.to_vec());
-        RetryIf::spawn(
-            self.retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                self._put_object(bucket, key, content.clone(), storage_class)
-                    .await
-            },
-            should_retry,
-        )
+        self.with_retry(|| async {
+            self._put_object(bucket, key, content.clone(), storage_class)
+                .await
+        })
         .await?;
 
         trace!("Put from memory to s3://{}/{}", bucket, key);
@@ -1007,17 +982,10 @@ impl S3Client {
         local_path: &str,
         storage_class: Option<&str>,
     ) -> Result<()> {
-        RetryIf::spawn(
-            self.retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                self._upload_object(bucket, key, local_path, storage_class)
-                    .await
-            },
-            should_retry,
-        )
+        self.with_retry(|| async {
+            self._upload_object(bucket, key, local_path, storage_class)
+                .await
+        })
         .await?;
 
         trace!("Uploaded from {} to s3://{}/{}", local_path, bucket, key);
@@ -1041,9 +1009,8 @@ impl S3Client {
         }
 
         // create the multipart upload
-        let create_multipart_upload_output = RetryIf::spawn(
-            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
+        let create_multipart_upload_output = self
+            .with_retry(|| async {
                 let mut builder = self
                     .client
                     .create_multipart_upload()
@@ -1058,10 +1025,8 @@ impl S3Client {
                     .send()
                     .await
                     .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            },
-            should_retry,
-        )
-        .await?;
+            })
+            .await?;
 
         let upload_id = create_multipart_upload_output
             .upload_id()
@@ -1211,9 +1176,8 @@ impl S3Client {
         // complete multipart upload
         let client = self.client.clone();
         let upload_parts_ref = &upload_parts;
-        let complete_multipart_upload_res = RetryIf::spawn(
-            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
+        let complete_multipart_upload_res = self
+            .with_retry(|| async {
                 let complete_multipart_upload_output = client
                     .complete_multipart_upload()
                     .bucket(bucket)
@@ -1228,9 +1192,8 @@ impl S3Client {
                     .await
                     .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
                 Ok(complete_multipart_upload_output)
-            },
-            should_retry,
-        ).await;
+            })
+            .await;
 
         if let Err(e) = complete_multipart_upload_res {
             error!("<upload_object_multipart> bucket={bucket} key={key} Failed to complete multipart upload! Abort multipart upload.");
@@ -1247,20 +1210,15 @@ impl S3Client {
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
-        RetryIf::spawn(
-            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                self
-                    .client
-                    .delete_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .send()
-                    .await
-                    .map_err(partial!(map_sdk_error => format!("<delete_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            },
-            should_retry,
-        )
+        self.with_retry(|| async {
+            self.client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(partial!(map_sdk_error => format!("<delete_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
+        })
         .await?;
 
         trace!("Deleted s3://{}/{}", bucket, key);
@@ -1275,27 +1233,23 @@ impl S3Client {
         dst_key: &str,
         storage_class: Option<&str>,
     ) -> Result<()> {
-        RetryIf::spawn(
-            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                let mut builder = self.client
-                    .copy_object()
-                    .bucket(dst_bucket)
-                    .key(dst_key)
-                    .copy_source(urlencoding::encode(&format!("{}/{}", src_bucket, src_key)));
+        self.with_retry(|| async {
+            let mut builder = self.client
+                .copy_object()
+                .bucket(dst_bucket)
+                .key(dst_key)
+                .copy_source(urlencoding::encode(&format!("{}/{}", src_bucket, src_key)));
 
-                if let Some(storage_class) = storage_class {
-                    let storage_class = StorageClass::from(storage_class);
-                    builder = builder.storage_class(storage_class);
-                }
+            if let Some(storage_class) = storage_class {
+                let storage_class = StorageClass::from(storage_class);
+                builder = builder.storage_class(storage_class);
+            }
 
-                builder
-                    .send()
-                    .await
-                    .map_err(partial!(map_sdk_error => format!("<copy_object> src_bucket={src_bucket} src_key={src_key} dst_bucket={dst_bucket} dst_key={dst_key} storage_class={:?}", storage_class), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            },
-            should_retry,
-        )
+            builder
+                .send()
+                .await
+                .map_err(partial!(map_sdk_error => format!("<copy_object> src_bucket={src_bucket} src_key={src_key} dst_bucket={dst_bucket} dst_key={dst_key} storage_class={:?}", storage_class), self.retry_config.retriable_client_status_codes.as_slice(), _))
+        })
         .await?;
 
         trace!(
@@ -1317,23 +1271,19 @@ impl S3Client {
         days: i32,
         tier: &str,
     ) -> Result<()> {
-        RetryIf::spawn(
-            self.retry_config.retry_strategy.clone().delay_iterator_with_jitter(self.retry_config.max_retries),
-            || async {
-                let restore_request = RestoreRequest::builder().days(days).glacier_job_parameters(
-                    GlacierJobParameters::builder().tier(Tier::from(tier)).build().map_err(|e| S3Error::ValidationError(e.to_string()))?
-                ).build();
-                self.client
-                    .restore_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .restore_request(restore_request)
-                    .send()
-                    .await
-                    .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={:?}", tier), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            },
-            should_retry,
-        )
+        self.with_retry(|| async {
+            let restore_request = RestoreRequest::builder().days(days).glacier_job_parameters(
+                GlacierJobParameters::builder().tier(Tier::from(tier)).build().map_err(|e| S3Error::ValidationError(e.to_string()))?
+            ).build();
+            self.client
+                .restore_object()
+                .bucket(bucket)
+                .key(key)
+                .restore_request(restore_request)
+                .send()
+                .await
+                .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={:?}", tier), self.retry_config.retriable_client_status_codes.as_slice(), _))
+        })
         .await?;
 
         trace!(
