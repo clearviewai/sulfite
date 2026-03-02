@@ -26,19 +26,21 @@ use tokio::{
 };
 use tokio_retry::RetryIf;
 
-/// Read timeout in seconds for the underlying HTTP client (boto default).
-const DEFAULT_READ_TIMEOUT: u64 = 60;
-/// HTTP status codes treated as retriable client errors. 408 Request Timeout, 429 Too Many Requests are standard.
+/// Default read timeout in seconds for the underlying HTTP client (boto default).
+pub const DEFAULT_READ_TIMEOUT: u64 = 60;
+/// Default HTTP status codes treated as retriable client errors (408 Request Timeout, 429 Too Many Requests).
 /// Error code SlowDown is also retried.
-const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[408, 429];
+pub const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[408, 429];
+/// Comma-separated default for CLI; must match DEFAULT_RETRIABLE_CLIENT_STATUS_CODES.
+pub const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR: &str = "408,429";
 /// Region used when the environment/config does not provide one.
-const FALLBACK_REGION: &str = "us-east-1";
+pub const FALLBACK_REGION: &str = "us-east-1";
 /// Buffer size for upload byte stream (1 MiB).
-const UPLOAD_BYTESTREAM_BUFFER_SIZE: usize = 1024 * 1024;
+pub const UPLOAD_BYTESTREAM_BUFFER_SIZE: usize = 1024 * 1024;
 /// Part size for multipart upload/download (20 MiB). Adaptive when file size would exceed MULTIPART_MAX_CHUNKS parts.
-const MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20;
+pub const MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20;
 /// S3 API limit on number of parts per multipart upload (10_000).
-const MULTIPART_MAX_CHUNKS: u64 = 10000;
+pub const MULTIPART_MAX_CHUNKS: u64 = 10000;
 
 /// Configuration for the underlying AWS S3 client (region, endpoint, credentials, timeouts).
 #[derive(Clone, Debug)]
@@ -81,6 +83,13 @@ impl Default for RetryConfig {
             retriable_client_status_codes: DEFAULT_RETRIABLE_CLIENT_STATUS_CODES.to_vec(),
         }
     }
+}
+
+/// BucketInfo
+#[derive(Clone, Debug)]
+pub struct BucketInfo {
+    pub name: String,
+    pub region: Option<String>,
 }
 
 /// Metadata for an S3 object (from HEAD or LIST).
@@ -127,7 +136,7 @@ impl<'a> ListObjectsV2PageIter<'a> {
         let resp = s3_client
             .with_retry(|| async {
                 let mut builder = s3_client
-                    .client
+                    .inner
                     .list_objects_v2()
                     .bucket(self.bucket)
                     .prefix(self.prefix);
@@ -169,12 +178,13 @@ impl<'a> ListObjectsV2PageIter<'a> {
 }
 
 /// Converts one SDK list_objects_v2 page into `(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)`.
+#[allow(clippy::result_large_err)]
 fn page_to_object_and_prefix_lists(
     item: &ListObjectsV2Output,
 ) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
     let mut objects: Vec<ObjectInfo> = vec![];
     let mut common_prefixes: Vec<CommonPrefixInfo> = vec![];
-    item.contents().into_iter().try_for_each(|object| {
+    item.contents().iter().try_for_each(|object| {
         objects.push(ObjectInfo {
             key: object.key().ok_or(S3Error::FieldNotExist("key"))?.into(),
             size: object.size().ok_or(S3Error::FieldNotExist("size"))? as u64,
@@ -204,7 +214,7 @@ fn page_to_object_and_prefix_lists(
         Result::Ok(())
     })?;
     item.common_prefixes()
-        .into_iter()
+        .iter()
         .try_for_each(|common_prefix| {
             common_prefixes.push(CommonPrefixInfo {
                 prefix: common_prefix
@@ -286,7 +296,7 @@ where
         }
         SdkError::ResponseError(response_error) => {
             if let Some(bytes) = response_error.raw().body().bytes() {
-                if let Ok(raw_content) = str::from_utf8(&bytes) {
+                if let Ok(raw_content) = str::from_utf8(bytes) {
                     if !raw_content.is_empty() {
                         debug!("[ResponseError] raw {}", raw_content);
                     }
@@ -296,7 +306,7 @@ where
         }
         SdkError::ServiceError(service_error) => {
             if let Some(bytes) = service_error.raw().body().bytes() {
-                if let Ok(raw_content) = str::from_utf8(&bytes) {
+                if let Ok(raw_content) = str::from_utf8(bytes) {
                     if !raw_content.is_empty() {
                         debug!("[ServiceError] raw {}", raw_content);
                     }
@@ -309,9 +319,9 @@ where
             let status_code = service_error.raw().status().as_u16();
             debug!("[ServiceError] status_code {}", status_code);
 
-            if retriable_client_status_codes.contains(&status_code) {
-                S3Error::RetriableClientError(context, e.into(), error_meta, status_code)
-            } else if error_meta.code() == Some("SlowDown") {
+            if retriable_client_status_codes.contains(&status_code)
+                || error_meta.code() == Some("SlowDown")
+            {
                 S3Error::RetriableClientError(context, e.into(), error_meta, status_code)
             } else if status_code >= 500 {
                 S3Error::RetriableServerError(context, e.into(), error_meta, status_code)
@@ -359,7 +369,7 @@ pub type Result<T> = std::result::Result<T, S3Error>;
 
 #[derive(Debug, Clone)]
 pub struct S3Client {
-    client: AWSS3Client,
+    pub inner: AWSS3Client,
     retry_config: RetryConfig,
 }
 
@@ -410,7 +420,7 @@ impl S3Client {
         config_builder = config_builder.force_path_style(true); // this allows http://minio:11000 style endpoint_url
 
         S3Client {
-            client: AWSS3Client::from_conf(config_builder.build()),
+            inner: AWSS3Client::from_conf(config_builder.build()),
             retry_config,
         }
     }
@@ -423,7 +433,7 @@ impl S3Client {
         }
 
         S3Client {
-            client: aws_s3_client,
+            inner: aws_s3_client,
             retry_config,
         }
     }
@@ -445,13 +455,50 @@ impl S3Client {
         .await
     }
 
+    pub async fn head_bucket(&self, bucket: &str) -> Result<BucketInfo> {
+        self.inner
+            .head_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(partial!(map_sdk_error => format!("<head_bucket> bucket={bucket}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
+        Ok(BucketInfo {
+            name: bucket.into(),
+            region: self.inner.config().region().map(|r| r.to_string()),
+        })
+    }
+
+    pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(partial!(
+                map_sdk_error => format!("<create_bucket> bucket={bucket}"),
+                self.retry_config.retriable_client_status_codes.as_slice(),
+                _
+            ))?;
+        Ok(())
+    }
+
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .delete_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(partial!(map_sdk_error => format!("<delete_bucket> bucket={bucket}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
+        Ok(())
+    }
+
     async fn _list_objects_v2_paginated(
         &self,
         bucket: &str,
         prefix: &str,
         delimiter: Option<&str>,
     ) -> Result<(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)> {
-        let mut builder = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
+        let mut builder = self.inner.list_objects_v2().bucket(bucket).prefix(prefix);
 
         if let Some(delimiter) = delimiter {
             builder = builder.delimiter(delimiter);
@@ -517,7 +564,7 @@ impl S3Client {
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
         let resp = self
             .with_retry(|| async {
-                self.client
+                self.inner
                     .head_object()
                     .bucket(bucket)
                     .key(key)
@@ -558,7 +605,7 @@ impl S3Client {
         key: &str,
         start_end_offsets: Option<(usize, usize)>,
     ) -> Result<(ObjectInfo, Vec<u8>)> {
-        let mut builder = self.client.get_object().bucket(bucket).key(key);
+        let mut builder = self.inner.get_object().bucket(bucket).key(key);
 
         if let Some(start_end_offsets) = start_end_offsets {
             if start_end_offsets.1 <= start_end_offsets.0 {
@@ -632,7 +679,7 @@ impl S3Client {
         local_path: &str,
         start_end_offsets: Option<(usize, usize)>,
     ) -> Result<ObjectInfo> {
-        let mut builder = self.client.get_object().bucket(bucket).key(key);
+        let mut builder = self.inner.get_object().bucket(bucket).key(key);
 
         if let Some(start_end_offsets) = start_end_offsets {
             if start_end_offsets.1 <= start_end_offsets.0 {
@@ -668,10 +715,10 @@ impl S3Client {
         };
 
         let local_path = local_path.to_owned();
-        let timestamp = object_info.timestamp.clone();
+        let timestamp = object_info.timestamp;
 
         // We create a temporary file to download the object to for atomicity.
-        // Temp file is removed only on body/stream error (in map_err below). On write/flush/rename failure a .{hex} file may remain.
+        // Temp file is removed only on body/stream error (in inspect_err below). On write/flush/rename failure a .{hex} file may remain.
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
         let mut file = BufWriter::with_capacity(
@@ -679,14 +726,14 @@ impl S3Client {
             tokio::fs::File::create(&local_path_tmp).await?,
         );
 
-        while let Some(bytes) =
-            resp.body.try_next().await.map_err(
-                partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
-            ).map_err(|e| {
-                // clean up
-                let _ = tokio::fs::remove_file(&local_path_tmp);
-                e
-            })?
+        while let Some(bytes) = resp.body.try_next().await.map_err(
+            partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
+        ).inspect_err(|_| {
+            let path = local_path_tmp.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(&path).await;
+            });
+        })?
         {
             file.write_all(&bytes).await?;
         }
@@ -735,7 +782,7 @@ impl S3Client {
     ) -> Result<ObjectInfo> {
         let resp = self
             .with_retry(|| async {
-                self.client
+                self.inner
                     .head_object()
                     .bucket(bucket)
                     .key(key)
@@ -800,7 +847,7 @@ impl S3Client {
                 .clone()
                 .delay_iterator_with_jitter(self.retry_config.max_retries);
             let retriable = self.retry_config.retriable_client_status_codes.clone();
-            let client = self.client.clone();
+            let client = self.inner.clone();
             let local_path_tmp = local_path_tmp_.clone();
             let bucket = bucket.to_string();
             let key = key.to_string();
@@ -882,7 +929,7 @@ impl S3Client {
             }
         }
 
-        if let Ok(_) = res_ {
+        if res_.is_ok() {
             let local_path_ = local_path.to_owned();
             // set the file mtime according to object timestamp
             tokio::task::spawn_blocking(move || {
@@ -917,7 +964,7 @@ impl S3Client {
         storage_class: Option<&str>,
     ) -> Result<()> {
         let body = ByteStream::from(content);
-        let mut builder = self.client.put_object().bucket(bucket).key(key).body(body);
+        let mut builder = self.inner.put_object().bucket(bucket).key(key).body(body);
 
         if let Some(storage_class) = storage_class {
             builder = builder.storage_class(StorageClass::from(storage_class));
@@ -964,7 +1011,7 @@ impl S3Client {
             .map_err(
             partial!(map_bytestream_upload_error => format!("<upload_object> bucket={bucket} key={key}"), _),
         )?;
-        let mut builder = self.client.put_object().bucket(bucket).key(key).body(body);
+        let mut builder = self.inner.put_object().bucket(bucket).key(key).body(body);
 
         if let Some(storage_class) = storage_class {
             builder = builder.storage_class(StorageClass::from(storage_class));
@@ -1014,7 +1061,7 @@ impl S3Client {
         let create_multipart_upload_output = self
             .with_retry(|| async {
                 let mut builder = self
-                    .client
+                    .inner
                     .create_multipart_upload()
                     .bucket(bucket)
                     .key(key);
@@ -1059,7 +1106,7 @@ impl S3Client {
                 .clone()
                 .delay_iterator_with_jitter(self.retry_config.max_retries);
             let retriable = self.retry_config.retriable_client_status_codes.clone();
-            let client = self.client.clone();
+            let client = self.inner.clone();
             let local_path = local_path.to_string();
             let bucket = bucket.to_string();
             let key = key.to_string();
@@ -1146,7 +1193,7 @@ impl S3Client {
 
         // evaluate errors and send abort multipart upload request if error
         let abort = || async {
-            let _ = self.client
+            let _ = self.inner
                 .abort_multipart_upload()
                 .bucket(bucket)
                 .key(key)
@@ -1176,7 +1223,7 @@ impl S3Client {
         upload_parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
 
         // complete multipart upload
-        let client = self.client.clone();
+        let client = self.inner.clone();
         let upload_parts_ref = &upload_parts;
         let complete_multipart_upload_res = self
             .with_retry(|| async {
@@ -1200,7 +1247,7 @@ impl S3Client {
         if let Err(e) = complete_multipart_upload_res {
             error!("<upload_object_multipart> bucket={bucket} key={key} Failed to complete multipart upload! Abort multipart upload.");
             abort().await;
-            return Err(e.into());
+            return Err(e);
         }
 
         debug!(
@@ -1213,7 +1260,7 @@ impl S3Client {
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.with_retry(|| async {
-            self.client
+            self.inner
                 .delete_object()
                 .bucket(bucket)
                 .key(key)
@@ -1236,7 +1283,7 @@ impl S3Client {
         storage_class: Option<&str>,
     ) -> Result<()> {
         self.with_retry(|| async {
-            let mut builder = self.client
+            let mut builder = self.inner
                 .copy_object()
                 .bucket(dst_bucket)
                 .key(dst_key)
@@ -1277,7 +1324,7 @@ impl S3Client {
             let restore_request = RestoreRequest::builder().days(days).glacier_job_parameters(
                 GlacierJobParameters::builder().tier(Tier::from(tier)).build().map_err(|e| S3Error::ValidationError(e.to_string()))?
             ).build();
-            self.client
+            self.inner
                 .restore_object()
                 .bucket(bucket)
                 .key(key)

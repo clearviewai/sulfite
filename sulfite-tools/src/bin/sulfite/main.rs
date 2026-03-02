@@ -17,10 +17,12 @@ async fn main() -> anyhow::Result<()> {
         S3ClientConfig {
             region: args.region.clone(),
             endpoint_url: args.endpoint_url.clone(),
+            read_timeout_secs: args.read_timeout,
             ..Default::default()
         },
         RetryConfig {
             max_retries: args.max_retries,
+            retriable_client_status_codes: args.retriable_client_status_codes,
             ..Default::default()
         },
     )

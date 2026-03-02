@@ -19,3 +19,16 @@ The AWS SDK is a little low-level for users to take advantage of the concurrency
 3. The async API doesn't agree well with the filesystem for high-throughput operations, when it comes to streaming small chunks from/to disk.
 
 To address them, we provide implementations for the parallel multipart download & upload, and higher-level retries. We also make sure the on-disk file is adequately buffered to avoid async-sync overhead.
+
+**Low-level access** — `S3Client` exposes the underlying AWS SDK client as the public `inner` field so you can call SDK operations not covered by this crate.
+
+## Testing
+
+Integration tests use [LocalStack](https://docs.localstack.cloud/) for S3.
+
+- **Local:** Start LocalStack, then run the ignored integration tests:
+  ```bash
+  docker run --rm -it -p 4566:4566 -e SERVICES=s3 localstack/localstack
+  cargo test -p sulfite --test localstack -- --ignored
+  ```
+- **CI:** GitHub Actions runs LocalStack as a service container and runs the same tests (see `.github/workflows/ci.yml`).

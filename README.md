@@ -36,6 +36,8 @@ Global options (can be used with any subcommand):
 - `--region`, `-r` — AWS region (or region of custom endpoint)
 - `--endpoint-url`, `-e` — S3 endpoint URL (e.g. for MinIO)
 - `--max-retries` — Maximum retries per request (default: 3)
+- `--retriable-client-status-codes` — HTTP status codes to treat as retriable (comma-separated; default: 408,429)
+- `--read-timeout` — Read timeout in seconds for the HTTP client (default: 60)
 
 ### Subcommands
 
@@ -83,7 +85,7 @@ sulfite list -b my-bucket -p my/prefix/ -o manifest.csv
 sulfite csv manifest.csv --has-header download -b my-bucket -p my/prefix/ -l ./downloaded
 ```
 
-Use `-c/--column-idx N` if the key column is not the first (0-based index).
+Use `--column-idx/-c N` if the key column is not the first (0-based index).
 
 **CSV skip behavior** — For `csv download` and `csv upload`, an item is skipped if the destination already exists with the same size and a destination timestamp that is not older than the source. Otherwise the existing file or object is overwritten. This avoids re-transferring unchanged files when re-running a batch.
 

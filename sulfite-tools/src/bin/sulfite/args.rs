@@ -1,6 +1,7 @@
 //! Clap CLI definitions for sulfite.
 
 use clap::{Parser, Subcommand};
+use sulfite::{DEFAULT_READ_TIMEOUT, DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR};
 
 /// S3 operations: list, single-object ops, or batch from CSV.
 #[derive(Parser)]
@@ -18,6 +19,12 @@ pub struct Cli {
     /// Maximum number of retries per request (default: 3).
     #[arg(long, global = true, default_value = "3")]
     pub max_retries: usize,
+    /// HTTP status codes to treat as retriable client errors (comma-separated; default: 408, 429).
+    #[arg(long, global = true, value_delimiter(','), value_parser = clap::value_parser!(u16), num_args(1..), default_value = DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR)]
+    pub retriable_client_status_codes: Vec<u16>,
+    /// Read timeout in seconds for the HTTP client (default: 60).
+    #[arg(long, global = true, default_value_t = DEFAULT_READ_TIMEOUT)]
+    pub read_timeout: u64,
 }
 
 #[derive(Subcommand)]

@@ -91,9 +91,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                                     }
                                 };
                                 if local_file_size == obj.size && local_mtime <= remote_mtime {
-                                    pb.as_ref().map(|pb| {
-                                        pb.set_message(format!("{key} already exists locally. Skipping."));
-                                    });
+                                    if let Some(pb) = pb.as_ref() { pb.set_message(format!("{key} already exists locally. Skipping.")); }
                                     return Ok(());
                                 } else {
                                     let local_ts = DateTime::<Utc>::from(local_mtime).format("%Y-%m-%dT%H:%M:%SZ");
@@ -113,7 +111,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                                 .with_context(|| format!("creating directory {dirname}"))?;
 
                             // < 1 GB → single GET; >= 1 GB → multipart download.
-                            if obj.size < 1 * 1024 * 1024 * 1024 {
+                            if obj.size < 1024 * 1024 * 1024 {
                                 client
                                     .download_object(&bucket, &key, &local_path, None)
                                     .await
@@ -152,9 +150,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                                     }
                                 };
                                 if local_file_size == obj.size && local_mtime <= remote_mtime {
-                                    pb.as_ref().map(|pb| {
-                                        pb.set_message(format!("{key} already exists on destination. Skipping."));
-                                    });
+                                    if let Some(pb) = pb.as_ref() { pb.set_message(format!("{key} already exists on destination. Skipping.")); }
                                     return Ok(());
                                 } else {
                                     let local_ts = DateTime::<Utc>::from(local_mtime).format("%Y-%m-%dT%H:%M:%SZ");
@@ -170,7 +166,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                             // >= 16 KB and < 1 GB → single-part with storage_class; >= 1 GB → multipart with storage_class.
                             if local_file_size < 16 * 1024 {
                                 client.upload_object(&bucket, &key, &local_path, None).await
-                            } else if local_file_size < 1 * 1024 * 1024 * 1024 {
+                            } else if local_file_size < 1024 * 1024 * 1024 {
                                 client
                                     .upload_object(&bucket, &key, &local_path, storage_class.as_deref())
                                     .await
@@ -205,9 +201,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                             // This happens when you idempotently copy an object into the same destination bucket and key with an archival tier storage class.
                             if let Some(storage_class) = src_obj.storage_class {
                                 if src_key == dst_key && (storage_class == "GLACIER" || storage_class == "DEEP_ARCHIVE") {
-                                    pb.as_ref().map(|pb| {
-                                        pb.set_message(format!("{src_key} is in archival tier. Skipping."));
-                                    });
+                                    if let Some(pb) = pb.as_ref() { pb.set_message(format!("{src_key} is in archival tier. Skipping.")); }
                                     return Ok(());
                                 }
                             }
@@ -248,7 +242,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                 if let Err(e) = res {
                     error!("{e:#}");
                 }
-                pb.as_ref().map(|pb| pb.inc(1));
+                if let Some(pb) = pb.as_ref() { pb.inc(1) }
             })
         })
         .buffer_unordered(if is_head { 1 } else { args.n_workers })
@@ -259,7 +253,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
         })
         .await;
 
-    pb.as_ref().map(|pb| pb.finish());
+    if let Some(pb) = pb.as_ref() { pb.finish() }
 
     Ok(())
 }

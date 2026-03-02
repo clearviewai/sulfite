@@ -19,7 +19,7 @@ pub async fn run_list(client: S3Client, args: ListArgs) -> anyhow::Result<()> {
     let mut writer = match &args.output_path {
         Some(p) => {
             let mut w = csv::Writer::from_path(p)?;
-            w.write_record(&["key", "size", "timestamp", "storage_class"])?;
+            w.write_record(["key", "size", "timestamp", "storage_class"])?;
             Some(w)
         }
         None => None,
@@ -46,7 +46,7 @@ pub async fn run_list(client: S3Client, args: ListArgs) -> anyhow::Result<()> {
                         key = s.to_string();
                     }
                 }
-                let _ = w.write_record(&[
+                let _ = w.write_record([
                     key.as_str(),
                     obj.size.to_string().as_str(),
                     obj.timestamp.to_string().as_str(),
