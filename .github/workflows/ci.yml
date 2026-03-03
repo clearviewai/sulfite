@@ -51,7 +51,12 @@ jobs:
       - name: Run unit tests
         run: cargo test -p sulfite
 
-      - name: Run LocalStack integration tests
+      - name: Run LocalStack integration tests (sulfite library)
         env:
           LOCALSTACK_ENDPOINT: http://localhost:4566
         run: cargo test -p sulfite --test localstack -- --ignored
+
+      - name: Run LocalStack integration tests (sulfite CLI)
+        env:
+          LOCALSTACK_ENDPOINT: http://localhost:4566
+        run: cargo test -p sulfite-tools --test localstack_cli -- --ignored

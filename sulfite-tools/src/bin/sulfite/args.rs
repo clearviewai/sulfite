@@ -16,13 +16,13 @@ pub struct Cli {
     /// The S3 endpoint URL (e.g. for MinIO or a custom endpoint).
     #[arg(short, long, global = true)]
     pub endpoint_url: Option<String>,
-    /// Maximum number of retries per request (default: 3).
+    /// Maximum number of retries per request.
     #[arg(long, global = true, default_value = "3")]
     pub max_retries: usize,
-    /// HTTP status codes to treat as retriable client errors (comma-separated; default: 408, 429).
+    /// HTTP status codes to treat as retriable client errors (comma-separated).
     #[arg(long, global = true, value_delimiter(','), value_parser = clap::value_parser!(u16), num_args(1..), default_value = DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR)]
     pub retriable_client_status_codes: Vec<u16>,
-    /// Read timeout in seconds for the HTTP client (default: 60).
+    /// Read timeout in seconds for the HTTP client.
     #[arg(long, global = true, default_value_t = DEFAULT_READ_TIMEOUT)]
     pub read_timeout: u64,
 }
@@ -65,7 +65,7 @@ pub struct ListArgs {
     /// The delimiter for common-prefix grouping (e.g. '/').
     #[arg(short, long, default_value = "/")]
     pub delimiter: String,
-    /// Maximum number of object keys and common prefixes to show in the console preview (default: 10). Does not limit CSV output or listing.
+    /// Maximum number of object keys and common prefixes to show in the console preview. Does not limit CSV output or listing.
     #[arg(short = 'm', long, default_value = "10")]
     pub display_max_entries: usize,
     /// The path to write the key list as CSV (omit to print to stdout).

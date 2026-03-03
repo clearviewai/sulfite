@@ -83,3 +83,13 @@ Use `--column-idx/-c N` if the key column is not the first (0-based index).
 **Archival and small files** — When you specify an archival storage class (e.g. `--storage-class GLACIER`) on `csv upload` or `csv copy`, objects under 16 KB are stored as STANDARD instead of the requested class, for efficiency.
 
 Run `sulfite --help` or `sulfite <command> --help` for full options.
+
+## Testing
+
+Integration tests run the CLI against [LocalStack](https://localstack.cloud/). Start LocalStack (e.g. `docker run --rm -it -p 4566:4566 localstack/localstack`), then:
+
+```bash
+cargo test -p sulfite-tools --test localstack_cli -- --ignored
+```
+
+Set `LOCALSTACK_ENDPOINT` to override the default `http://localhost:4566`.

@@ -30,3 +30,6 @@ indicatif = { version = "0.18", features = ["tokio"] }
 log = "0.4"
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
+
+[dev-dependencies]
+sulfite = { path = "../sulfite" }

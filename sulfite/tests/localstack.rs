@@ -3,7 +3,7 @@
 //! Requires LocalStack running (e.g. `docker run --rm -it -p 4566:4566 localstack/localstack`).
 //! Set `LOCALSTACK_ENDPOINT` to override default `http://localhost:4566`.
 //!
-//! Each test uses random hex (32) in bucket or prefix so tests are independent and can run in parallel.
+//! Each test uses random hex in bucket or prefix so tests are independent and can run in parallel.
 //! Cleanup is best-effort; the LocalStack container can be removed to reset state.
 
 use rstest::rstest;
