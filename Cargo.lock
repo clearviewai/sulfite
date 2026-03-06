@@ -2459,6 +2459,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "filetime",
+ "indicatif",
  "log",
  "partial_application",
  "rand 0.10.0",

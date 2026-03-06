@@ -25,5 +25,11 @@ tokio-retry = "0.3"
 thiserror = "2"
 urlencoding = "2.1"
 
+indicatif = { version = "0.18", features = ["tokio"], optional = true }
+
+[features]
+default = []
+indicatif = ["dep:indicatif"]
+
 [dev-dependencies]
 rstest = "0.26"

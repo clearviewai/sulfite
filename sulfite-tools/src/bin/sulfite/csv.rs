@@ -67,7 +67,7 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                                 .with_context(|| format!("heading key {key}"))?;
                             println!("{obj:?}");
                         }
-                        CsvCommand::Download { bucket, prefix, suffix, local_dir, n_inner_workers, .. } => {
+                        CsvCommand::Download { bucket, prefix, suffix, local_dir, .. } => {
                             let mut local_path = key.clone();
                             local_path = format!("{local_dir}/{local_path}");
                             let key = format!("{prefix}{key}{suffix}");
@@ -121,14 +121,14 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                                         &bucket,
                                         &key,
                                         &local_path,
-                                        Some(n_inner_workers),
+                                        None::<&indicatif::ProgressBar>,
                                     )
                                     .await
                             }
                             .with_context(|| format!("downloading object {key}"))?;
                             debug!("object {key} downloaded.");
                         }
-                        CsvCommand::Upload { bucket, prefix, suffix, local_dir, storage_class, n_inner_workers, .. } => {
+                        CsvCommand::Upload { bucket, prefix, suffix, local_dir, storage_class, .. } => {
                             let mut local_path = key.clone();
                             local_path = format!("{local_dir}/{local_path}");
                             let key = format!("{prefix}{key}{suffix}");
@@ -176,8 +176,8 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                                         &bucket,
                                         &key,
                                         &local_path,
-                                        Some(n_inner_workers),
                                         storage_class.as_deref(),
+                                        None::<&indicatif::ProgressBar>,
                                     )
                                     .await
                             }

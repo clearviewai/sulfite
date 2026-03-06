@@ -18,6 +18,8 @@ async fn main() -> anyhow::Result<()> {
             region: args.region.clone(),
             endpoint_url: args.endpoint_url.clone(),
             read_timeout_secs: args.read_timeout,
+            multipart_chunk_size: args.multipart_chunk_size,
+            multipart_n_workers: args.multipart_workers,
             ..Default::default()
         },
         RetryConfig {

@@ -1,7 +1,9 @@
 //! Clap CLI definitions for sulfite.
 
 use clap::{Parser, Subcommand};
-use sulfite::{DEFAULT_READ_TIMEOUT, DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR};
+use sulfite::{
+    DEFAULT_MULTIPART_CHUNK_SIZE, DEFAULT_READ_TIMEOUT, DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR,
+};
 
 /// S3 operations: list, single-object ops, or batch from CSV.
 #[derive(Parser)]
@@ -25,6 +27,12 @@ pub struct Cli {
     /// Read timeout in seconds for the HTTP client.
     #[arg(long, global = true, default_value_t = DEFAULT_READ_TIMEOUT)]
     pub read_timeout: u64,
+    /// Part size in bytes for multipart upload/download (default: 20 MiB).
+    #[arg(long, global = true, default_value_t = DEFAULT_MULTIPART_CHUNK_SIZE)]
+    pub multipart_chunk_size: u64,
+    /// Number of parallel workers for multipart upload/download.
+    #[arg(long, global = true, default_value_t = 10)]
+    pub multipart_workers: usize,
 }
 
 #[derive(Subcommand)]
@@ -264,9 +272,6 @@ pub enum CsvCommand {
         /// The local directory to download into (defaults to current directory).
         #[arg(short, long, default_value = ".")]
         local_dir: String,
-        /// Number of parallel workers per multipart download (per-operation concurrency).
-        #[arg(long, default_value = "10")]
-        n_inner_workers: usize,
     },
     /// Upload each key from files under the local directory.
     Upload {
@@ -285,9 +290,6 @@ pub enum CsvCommand {
         /// The storage class (e.g. STANDARD, GLACIER).
         #[arg(long)]
         storage_class: Option<String>,
-        /// Number of parallel workers per multipart upload (per-operation concurrency).
-        #[arg(long, default_value = "10")]
-        n_inner_workers: usize,
     },
     /// Delete each key.
     Delete {

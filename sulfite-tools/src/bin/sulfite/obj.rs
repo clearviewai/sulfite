@@ -2,6 +2,7 @@ use anyhow::Context;
 use sulfite::S3Client;
 
 use crate::ObjCommand;
+use sulfite_tools::utils::make_progress_bar;
 
 pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()> {
     match command {
@@ -30,9 +31,11 @@ pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()
                     .and_then(|os_str| os_str.to_str())
                     .context("key has no file name")?,
             };
+            let pb = make_progress_bar(None);
             client
-                .download_object_multipart(&a.bucket, &a.key, local_path, Some(a.n_workers))
+                .download_object_multipart(&a.bucket, &a.key, local_path, Some(&pb))
                 .await?;
+            pb.finish();
         }
         ObjCommand::Upload(a) => {
             client
@@ -40,15 +43,17 @@ pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()
                 .await?;
         }
         ObjCommand::UploadMultipart(a) => {
+            let pb = make_progress_bar(None);
             client
                 .upload_object_multipart(
                     &a.bucket,
                     &a.key,
                     &a.local_path,
-                    Some(a.n_workers),
                     a.storage_class.as_deref(),
+                    Some(&pb),
                 )
                 .await?;
+            pb.finish();
         }
         ObjCommand::Delete(a) => {
             client.delete_object(&a.bucket, &a.key).await?;

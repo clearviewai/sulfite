@@ -18,7 +18,7 @@ doc = false
 
 [dependencies]
 # Path used for local dev; when published, only version is used (publish sulfite first).
-sulfite = { version = "0.0.8", path = "../sulfite" }
+sulfite = { version = "0.0.8", path = "../sulfite", features = ["indicatif"] }
 
 anyhow = "1.0"
 env_logger = "0.11"

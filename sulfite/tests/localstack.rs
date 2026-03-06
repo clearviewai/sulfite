@@ -507,7 +507,13 @@ async fn multipart_upload_download_size(#[case] size_mb: u64) {
 
     // Multipart upload to S3
     client
-        .upload_object_multipart(TEST_BUCKET, &key, upload_path.to_str().unwrap(), None, None)
+        .upload_object_multipart(
+            TEST_BUCKET,
+            &key,
+            upload_path.to_str().unwrap(),
+            None,
+            None::<&sulfite::NoopProgressBar>,
+        )
         .await
         .expect("upload_object_multipart");
 
@@ -520,7 +526,12 @@ async fn multipart_upload_download_size(#[case] size_mb: u64) {
 
     // Multipart download to second file
     client
-        .download_object_multipart(TEST_BUCKET, &key, download_path.to_str().unwrap(), None)
+        .download_object_multipart(
+            TEST_BUCKET,
+            &key,
+            download_path.to_str().unwrap(),
+            None::<&sulfite::NoopProgressBar>,
+        )
         .await
         .expect("download_object_multipart");
 

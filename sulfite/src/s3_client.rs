@@ -28,6 +28,8 @@ use tokio_retry::RetryIf;
 
 /// Default read timeout in seconds for the underlying HTTP client (boto default).
 pub const DEFAULT_READ_TIMEOUT: u64 = 60;
+/// Default maximum number of attempts for our high-level retries (0 means no high-level retries and rely on the underlying SDK retries).
+pub const DEFAULT_MAX_RETRIES: usize = 0;
 /// Default HTTP status codes treated as retriable client errors (408 Request Timeout, 429 Too Many Requests).
 /// Error code SlowDown is also retried.
 pub const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES: &[u16] = &[408, 429];
@@ -36,11 +38,47 @@ pub const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR: &str = "408,429";
 /// Region used when the environment/config does not provide one.
 pub const FALLBACK_REGION: &str = "us-east-1";
 /// Buffer size for upload byte stream (1 MiB).
-pub const UPLOAD_BYTESTREAM_BUFFER_SIZE: usize = 1024 * 1024;
+pub const FILE_BUFFER_SIZE: usize = 1024 * 1024;
 /// Part size for multipart upload/download (20 MiB). Adaptive when file size would exceed MULTIPART_MAX_CHUNKS parts.
-pub const MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20;
+pub const DEFAULT_MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20;
+/// Number of parallel workers for multipart download/upload when not overridden per call (default: 1).
+pub const DEFAULT_MULTIPART_N_WORKERS: usize = 1;
 /// S3 API limit on number of parts per multipart upload (10_000).
 pub const MULTIPART_MAX_CHUNKS: u64 = 10000;
+
+/// Progress bar for multipart transfer (e.g. chunk count). Use with [`download_object_multipart`](S3Client::download_object_multipart) and [`upload_object_multipart`](S3Client::upload_object_multipart).
+/// When the `indicatif` feature is enabled, [`indicatif::ProgressBar`] implements this trait.
+pub trait ProgressBar: Send + Sync + Clone {
+    /// Set the total number of units (e.g. chunks).
+    fn set_length(&self, len: u64);
+    /// Advance by `delta` units (e.g. one chunk completed).
+    fn inc(&self, delta: u64);
+    /// Mark the progress bar as finished.
+    fn finish(&self);
+}
+
+#[cfg(feature = "indicatif")]
+impl ProgressBar for indicatif::ProgressBar {
+    fn set_length(&self, len: u64) {
+        indicatif::ProgressBar::set_length(self, len);
+    }
+    fn inc(&self, delta: u64) {
+        indicatif::ProgressBar::inc(self, delta);
+    }
+    fn finish(&self) {
+        indicatif::ProgressBar::finish(self);
+    }
+}
+
+/// No-op progress bar. Use when progress reporting is not needed (e.g. in tests).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopProgressBar;
+
+impl ProgressBar for NoopProgressBar {
+    fn set_length(&self, _len: u64) {}
+    fn inc(&self, _delta: u64) {}
+    fn finish(&self) {}
+}
 
 /// Configuration for the underlying AWS S3 client (region, endpoint, credentials, timeouts).
 #[derive(Clone, Debug)]
@@ -51,6 +89,10 @@ pub struct S3ClientConfig {
     pub access_secret_session_tuple: Option<(String, String, Option<String>)>,
     /// Read timeout in seconds for the HTTP client (default: 60).
     pub read_timeout_secs: u64,
+    /// Part size for multipart upload/download in bytes (default: 20 MiB). Adaptive when file size would exceed MULTIPART_MAX_CHUNKS parts.
+    pub multipart_chunk_size: u64,
+    /// Number of parallel workers for multipart download/upload when not overridden per call (default: 1).
+    pub multipart_n_workers: usize,
 }
 
 impl Default for S3ClientConfig {
@@ -61,6 +103,8 @@ impl Default for S3ClientConfig {
             profile_name: None,
             access_secret_session_tuple: None,
             read_timeout_secs: DEFAULT_READ_TIMEOUT,
+            multipart_chunk_size: DEFAULT_MULTIPART_CHUNK_SIZE,
+            multipart_n_workers: DEFAULT_MULTIPART_N_WORKERS,
         }
     }
 }
@@ -78,7 +122,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 0,
+            max_retries: DEFAULT_MAX_RETRIES,
             retry_strategy: RetryStrategy::default(),
             retriable_client_status_codes: DEFAULT_RETRIABLE_CLIENT_STATUS_CODES.to_vec(),
         }
@@ -371,6 +415,8 @@ pub type Result<T> = std::result::Result<T, S3Error>;
 pub struct S3Client {
     pub inner: AWSS3Client,
     retry_config: RetryConfig,
+    multipart_chunk_size: u64,
+    multipart_n_workers: usize,
 }
 
 impl S3Client {
@@ -422,12 +468,20 @@ impl S3Client {
         S3Client {
             inner: AWSS3Client::from_conf(config_builder.build()),
             retry_config,
+            multipart_chunk_size: config.multipart_chunk_size,
+            multipart_n_workers: config.multipart_n_workers,
         }
     }
 
     /// Build from an existing SDK client. Use [`RetryConfig::default`] for default AWS client retry behavior (no high-level retries from this crate).
     /// When both high-level (this crate) and low-level (SDK) retries are enabled, logs a warning (double retries).
-    pub fn new_with_aws_s3_client(aws_s3_client: AWSS3Client, retry_config: RetryConfig) -> Self {
+    /// Uses [`DEFAULT_MULTIPART_CHUNK_SIZE`] and [`DEFAULT_MULTIPART_N_WORKERS`] unless overridden.
+    pub fn new_with_aws_s3_client(
+        aws_s3_client: AWSS3Client,
+        retry_config: RetryConfig,
+        multipart_chunk_size: Option<u64>,
+        multipart_n_workers: Option<usize>,
+    ) -> Self {
         if retry_config.max_retries > 0 && aws_s3_client.config().retry_config().is_some() {
             warn!("High-level retries are enabled but low-level retries are also enabled.");
         }
@@ -435,6 +489,8 @@ impl S3Client {
         S3Client {
             inner: aws_s3_client,
             retry_config,
+            multipart_chunk_size: multipart_chunk_size.unwrap_or(DEFAULT_MULTIPART_CHUNK_SIZE),
+            multipart_n_workers: multipart_n_workers.unwrap_or(DEFAULT_MULTIPART_N_WORKERS),
         }
     }
 
@@ -724,7 +780,7 @@ impl S3Client {
 
         let result: Result<()> = async {
             let mut file = BufWriter::with_capacity(
-                1024 * 1024, // 1MB buffer
+                FILE_BUFFER_SIZE,
                 tokio::fs::File::create(&local_path_tmp).await?,
             );
             while let Some(bytes) = resp.body.try_next().await.map_err(
@@ -781,13 +837,16 @@ impl S3Client {
         Ok(obj)
     }
 
-    pub async fn download_object_multipart(
+    pub async fn download_object_multipart<P>(
         &self,
         bucket: &str,
         key: &str,
         local_path: &str,
-        n_downloaders: Option<usize>,
-    ) -> Result<ObjectInfo> {
+        pb: Option<&P>,
+    ) -> Result<ObjectInfo>
+    where
+        P: ProgressBar + 'static,
+    {
         let resp = self
             .with_retry(|| async {
                 self.inner
@@ -832,13 +891,17 @@ impl S3Client {
             return Ok(object_info);
         }
 
-        let mut chunk_count = (file_size / MULTIPART_CHUNK_SIZE) + 1;
-        let mut size_of_last_chunk = file_size % MULTIPART_CHUNK_SIZE;
+        let chunk_size = self.multipart_chunk_size;
+        let mut chunk_count = (file_size / chunk_size) + 1;
+        let mut size_of_last_chunk = file_size % chunk_size;
         if size_of_last_chunk == 0 {
-            size_of_last_chunk = MULTIPART_CHUNK_SIZE;
+            size_of_last_chunk = chunk_size;
             chunk_count -= 1;
         }
         debug!("Chunk count: {}", chunk_count);
+        if let Some(p) = pb {
+            p.set_length(chunk_count as u64);
+        }
 
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
@@ -846,7 +909,7 @@ impl S3Client {
         tokio::fs::File::create(&local_path_tmp).await?;
 
         // parallel download
-        let sem = Arc::new(Semaphore::new(n_downloaders.unwrap_or(1)));
+        let sem = Arc::new(Semaphore::new(self.multipart_n_workers));
         let mut join_set = tokio::task::JoinSet::new();
         for chunk_index in 0..chunk_count {
             let retry_iterator = self
@@ -859,6 +922,7 @@ impl S3Client {
             let local_path_tmp = local_path_tmp_.clone();
             let bucket = bucket.to_string();
             let key = key.to_string();
+            let pb = pb.map(|p| p.clone());
 
             let permit = Arc::clone(&sem).acquire_owned().await;
             join_set.spawn(async move {
@@ -867,10 +931,10 @@ impl S3Client {
                 let this_chunk = if chunk_count - 1 == chunk_index {
                     size_of_last_chunk
                 } else {
-                    MULTIPART_CHUNK_SIZE
+                    chunk_size
                 };
 
-                let start_offset = chunk_index * MULTIPART_CHUNK_SIZE;
+                let start_offset = chunk_index * chunk_size;
                 let end_offset = start_offset + this_chunk;
 
                 RetryIf::spawn(
@@ -891,7 +955,7 @@ impl S3Client {
                         debug!("Done getting chunk {}", chunk_index);
 
                         let mut file = BufWriter::with_capacity(
-                            1024 * 1024, // 1MB buffer
+                            FILE_BUFFER_SIZE,
                             tokio::fs::OpenOptions::new()
                                 .write(true)
                                 .open(&local_path_tmp).await?,
@@ -914,6 +978,9 @@ impl S3Client {
                 )
                 .await?;
 
+                if let Some(p) = &pb {
+                    p.inc(1);
+                }
                 Ok(())
             });
         }
@@ -1013,7 +1080,7 @@ impl S3Client {
     ) -> Result<()> {
         let body = ByteStream::read_from()
             .path(local_path)
-            .buffer_size(UPLOAD_BYTESTREAM_BUFFER_SIZE)
+            .buffer_size(FILE_BUFFER_SIZE)
             .build()
             .await
             .map_err(
@@ -1050,14 +1117,17 @@ impl S3Client {
         Ok(())
     }
 
-    pub async fn upload_object_multipart(
+    pub async fn upload_object_multipart<P>(
         &self,
         bucket: &str,
         key: &str,
         local_path: &str,
-        n_uploaders: Option<usize>,
         storage_class: Option<&str>,
-    ) -> Result<()> {
+        pb: Option<&P>,
+    ) -> Result<()>
+    where
+        P: ProgressBar + 'static,
+    {
         let file_size = tokio::fs::metadata(local_path).await?.len();
         if file_size == 0 {
             self.put_object(bucket, key, vec![].as_slice(), storage_class)
@@ -1090,8 +1160,8 @@ impl S3Client {
             .ok_or(S3Error::FieldNotExist("upload_id"))?;
 
         // Prepare the file to upload - chunking scheme. Adaptive size keeps part count <= MULTIPART_MAX_CHUNKS.
-        let mut multipart_chunk_size = MULTIPART_CHUNK_SIZE;
-        if file_size > MULTIPART_CHUNK_SIZE * MULTIPART_MAX_CHUNKS {
+        let mut multipart_chunk_size = self.multipart_chunk_size;
+        if file_size > multipart_chunk_size * MULTIPART_MAX_CHUNKS {
             multipart_chunk_size = file_size / (MULTIPART_MAX_CHUNKS - 1);
             info!("File size larger than 200GB. Using adaptive chunk size {multipart_chunk_size}.");
         }
@@ -1103,9 +1173,12 @@ impl S3Client {
             chunk_count -= 1;
         }
         debug!("Chunk count: {}", chunk_count);
+        if let Some(p) = pb {
+            p.set_length(chunk_count as u64);
+        }
 
         // parallel upload
-        let sem = Arc::new(Semaphore::new(n_uploaders.unwrap_or(1)));
+        let sem = Arc::new(Semaphore::new(self.multipart_n_workers));
         let mut join_set = tokio::task::JoinSet::new();
         for chunk_index in 0..chunk_count {
             let retry_iterator = self
@@ -1119,6 +1192,7 @@ impl S3Client {
             let bucket = bucket.to_string();
             let key = key.to_string();
             let upload_id = upload_id.to_string();
+            let pb = pb.map(|p| p.clone());
 
             let permit = Arc::clone(&sem).acquire_owned().await;
             join_set.spawn(async move {
@@ -1136,7 +1210,7 @@ impl S3Client {
 
                     let body = ByteStream::read_from()
                         .path(&local_path)
-                        .buffer_size(UPLOAD_BYTESTREAM_BUFFER_SIZE)
+                        .buffer_size(FILE_BUFFER_SIZE)
                         .offset(chunk_index * multipart_chunk_size)
                         .length(Length::Exact(this_chunk))
                         .build()
@@ -1162,6 +1236,9 @@ impl S3Client {
                 )
                 .await?;
 
+                if let Some(p) = &pb {
+                    p.inc(1);
+                }
                 Ok((
                     upload_part_output.e_tag.ok_or(S3Error::FieldNotExist("etag"))?,
                     part_number,
