@@ -47,14 +47,30 @@ Global options (can be used with any subcommand):
 
 ```bash
 # List keys in a bucket with prefix, write to CSV
-sulfite list -b my-bucket -p my/prefix/ -o keys.csv
+--> sulfite list -b my-bucket -p my-prefix/ -o keys.csv
+Found 3 objects.
+Listing first 3...
+  my-object-1.txt
+    size: 276480 (270.00K) timestamp: 2025-06-15T15:06:42Z storage_class: DEEP_ARCHIVE
+  my-object-2.txt
+    size: 20480 (20.00K) timestamp: 2025-07-06T13:11:54Z storage_class: STANDARD
+  my-object-3.txt
+    size: 81559 (79.65K) timestamp: 2025-06-15T15:10:21Z storage_class: STANDARD
+```
 
+```bash
 # Get metadata (HEAD) for one object
-sulfite head -b my-bucket -k path/to/object
+--> sulfite head -b my-bucket -k my-object-1.txt
+ObjectInfo { key: "my-object-1.txt", size: 276480, timestamp: 2025-06-15T15:06:42Z, storage_class: Some("DEEP_ARCHIVE"), restore_status: None }
+```
 
-# Download an object
-sulfite download -b my-bucket -k path/to/object -l local-file
+```bash
+# Download with multipart (large files)
+--> sulfite download-multipart -b my-bucket -k my-large-object.txt -l my-large-object.txt
+⠤ [#>--------------------------------------]     130/3104    [00:00:07<00:03:09 15.6583/s]
+```
 
+```bash
 # Upload with multipart (large files)
 sulfite upload-multipart -b my-bucket -k path/to/object -l local-file
 

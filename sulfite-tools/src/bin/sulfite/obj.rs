@@ -31,7 +31,7 @@ pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()
                     .and_then(|os_str| os_str.to_str())
                     .context("key has no file name")?,
             };
-            let pb = make_progress_bar(None);
+            let pb = make_progress_bar(Some(0));
             client
                 .download_object_multipart(&a.bucket, &a.key, local_path, Some(&pb))
                 .await?;
@@ -43,7 +43,7 @@ pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()
                 .await?;
         }
         ObjCommand::UploadMultipart(a) => {
-            let pb = make_progress_bar(None);
+            let pb = make_progress_bar(Some(0));
             client
                 .upload_object_multipart(
                     &a.bucket,
