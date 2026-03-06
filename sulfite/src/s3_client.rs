@@ -718,38 +718,46 @@ impl S3Client {
         let timestamp = object_info.timestamp;
 
         // We create a temporary file to download the object to for atomicity.
-        // Temp file is removed only on body/stream error (in inspect_err below). On write/flush/rename failure a .{hex} file may remain.
+        // Temp file is cleaned up on any error (stream, write, flush, mtime, or rename).
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
-        let mut file = BufWriter::with_capacity(
-            1024 * 1024, // 1MB buffer
-            tokio::fs::File::create(&local_path_tmp).await?,
-        );
 
-        while let Some(bytes) = resp.body.try_next().await.map_err(
-            partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
-        ).inspect_err(|_| {
-            let path = local_path_tmp.clone();
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(&path).await;
-            });
-        })?
-        {
-            file.write_all(&bytes).await?;
+        let result: Result<()> = async {
+            let mut file = BufWriter::with_capacity(
+                1024 * 1024, // 1MB buffer
+                tokio::fs::File::create(&local_path_tmp).await?,
+            );
+            while let Some(bytes) = resp.body.try_next().await.map_err(
+                partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
+            )? {
+                file.write_all(&bytes).await?;
+            }
+            file.flush().await?;
+            // Set the file mtime according to object timestamp.
+            tokio::task::spawn_blocking({
+                let local_path_tmp = local_path_tmp.clone();
+                move || {
+                    filetime::set_file_mtime(
+                        &local_path_tmp,
+                        filetime::FileTime::from_unix_time(
+                            timestamp.secs(),
+                            timestamp.subsec_nanos(),
+                        ),
+                    )?;
+                    std::fs::rename(&local_path_tmp, &local_path)?;
+                    Result::Ok(())
+                }
+            })
+            .await
+            .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
+            Ok(())
         }
-        file.flush().await?;
+        .await;
 
-        // set the file mtime according to object timestamp
-        tokio::task::spawn_blocking(move || {
-            filetime::set_file_mtime(
-                &local_path_tmp,
-                filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
-            )?;
-            std::fs::rename(&local_path_tmp, &local_path)?;
-            Result::Ok(())
-        })
-        .await
-        .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&local_path_tmp).await;
+        }
+        result?;
 
         Ok(object_info)
     }
