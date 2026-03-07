@@ -17,13 +17,11 @@ use core::str;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use partial_application::partial;
+use std::io::{BufWriter, Seek, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::{
-    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
-    sync::Semaphore,
-};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_retry::RetryIf;
 
 /// Default read timeout in seconds for the underlying HTTP client (boto default).
@@ -778,44 +776,90 @@ impl S3Client {
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
 
-        let result: Result<()> = async {
-            let mut file = BufWriter::with_capacity(
-                FILE_BUFFER_SIZE,
-                tokio::fs::File::create(&local_path_tmp).await?,
-            );
-            while let Some(bytes) = resp.body.try_next().await.map_err(
-                partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
-            )? {
-                file.write_all(&bytes).await?;
-            }
-            file.flush().await?;
-            // Set the file mtime according to object timestamp.
-            tokio::task::spawn_blocking({
-                let local_path_tmp = local_path_tmp.clone();
-                move || {
+        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(256);
+        let (tx, rx) = oneshot::channel::<()>();
+        let local_path_tmp_w = local_path_tmp.clone();
+        let local_path_w = local_path.clone();
+        // Use spawn_blocking to avoid slowing down the async runtime.
+        let t_writer = tokio::task::spawn_blocking(move || {
+            let res = (|| {
+                let mut file = BufWriter::with_capacity(
+                    FILE_BUFFER_SIZE, // 1MB buffer
+                    std::fs::File::create(&local_path_tmp_w)?,
+                );
+                while let Some(bytes) = receiver.blocking_recv() {
+                    file.write_all(&bytes)?;
+                }
+                file.flush()?;
+                // Success indicator: if Ok, parent completed the stream; set mtime and rename.
+                if rx.blocking_recv().is_ok() {
+                    // Set the file mtime according to object timestamp.
                     filetime::set_file_mtime(
-                        &local_path_tmp,
+                        &local_path_tmp_w,
                         filetime::FileTime::from_unix_time(
                             timestamp.secs(),
                             timestamp.subsec_nanos(),
                         ),
                     )?;
-                    std::fs::rename(&local_path_tmp, &local_path)?;
+                    std::fs::rename(&local_path_tmp_w, &local_path_w)?;
+                    return Ok(true);
+                }
+                Result::Ok(false)
+            })();
+            match res {
+                Ok(true) => Result::Ok(()),
+                Ok(false) => {
+                    // Parent failed (stream error or sender dropped). Parent returns its own error (may be retried).
+                    // Small chance this task is canceled when runtime is shutting down; ok because we use random-suffixed temp files.
+                    // We don't bother returning the error from this task.
+                    let _ = std::fs::remove_file(&local_path_tmp_w);
                     Result::Ok(())
                 }
-            })
-            .await
-            .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
+                Err(e) => {
+                    // On writer task failures, cleanup temp file and propagate the error.
+                    let _ = std::fs::remove_file(&local_path_tmp_w);
+                    Err(e)
+                }
+            }
+        });
+
+        let stream_result: Result<()> = async {
+            while let Some(bytes) = resp
+                .body
+                .try_next()
+                .await
+                .map_err(partial!(
+                    map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _
+                ))?
+            {
+                if sender.send(bytes.to_vec()).await.is_err() {
+                    break;
+                }
+            }
+
             Ok(())
         }
         .await;
 
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&local_path_tmp).await;
+        // Dropping sender exits the writer's while loop.
+        drop(sender);
+        match stream_result {
+            Ok(()) => {
+                // Signal success; catch send error by awaiting the task below.
+                let _ = tx.send(());
+                // Writer errors (e.g. IO) are not retriable.
+                t_writer
+                    .await
+                    .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
+                Ok(object_info)
+            }
+            Err(e) => {
+                drop(tx);
+                // Await writer so it can cleanup temp file before retry.
+                let _ = t_writer.await;
+                Err(e)
+            }
         }
-        result?;
-
-        Ok(object_info)
     }
 
     pub async fn download_object(
@@ -917,7 +961,8 @@ impl S3Client {
                 .retry_strategy
                 .clone()
                 .delay_iterator_with_jitter(self.retry_config.max_retries);
-            let retriable = self.retry_config.retriable_client_status_codes.clone();
+            let retriable_client_status_codes =
+                self.retry_config.retriable_client_status_codes.clone();
             let client = self.inner.clone();
             let local_path_tmp = local_path_tmp_.clone();
             let bucket = bucket.to_string();
@@ -950,29 +995,59 @@ impl S3Client {
                             .range(range)
                             .send()
                             .await.map_err(
-                                partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), retriable.as_slice(), _),
+                                partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), retriable_client_status_codes.as_slice(), _),
                             )?;
                         debug!("Done getting chunk {}", chunk_index);
 
-                        let mut file = BufWriter::with_capacity(
-                            FILE_BUFFER_SIZE,
-                            tokio::fs::OpenOptions::new()
-                                .write(true)
-                                .open(&local_path_tmp).await?,
-                        );
-                        file.seek(std::io::SeekFrom::Start(start_offset)).await?;
+                        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(256);
+                        let local_path_tmp = local_path_tmp.clone();
+                        // Use spawn_blocking to avoid slowing down the async runtime.
+                        let t_writer = tokio::task::spawn_blocking(move || {
+                            let mut file = BufWriter::with_capacity(
+                                FILE_BUFFER_SIZE, // 1MB buffer
+                                std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&local_path_tmp)?,
+                            );
+                            file.seek(std::io::SeekFrom::Start(start_offset))?;
 
-                        debug!("Streaming chunk {} to file", chunk_index);
-                        while let Some(bytes) =
-                            resp.body.try_next().await.map_err(
-                            partial!(map_bytestream_download_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _))?
-                        {
-                            file.write_all(&bytes).await?;
+                            debug!("Streaming chunk {} to file", chunk_index);
+                            while let Some(bytes) = receiver.blocking_recv() {
+                                file.write_all(&bytes)?;
+                            }
+                            file.flush()?;
+                            debug!("Done streaming chunk {} to file", chunk_index);
+                            Result::Ok(())
+                        });
+
+                        let stream_result: Result<()> = async {
+                            while let Some(bytes) =
+                                resp.body.try_next().await.map_err(
+                                partial!(map_bytestream_download_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _))?
+                            {
+                                if sender.send(bytes.to_vec()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(())
+                        }.await;
+
+                        // Dropping sender exits the writer's while loop.
+                        drop(sender);
+                        match stream_result {
+                            Ok(()) => {
+                                // Writer errors (e.g. IO) are not retriable.
+                                t_writer
+                                    .await
+                                    .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
+                                Ok(())
+                            }
+                            Err(e) => {
+                                // Await writer before returning so retry doesn't race with a detached writer.
+                                let _ = t_writer.await;
+                                Err(e)
+                            }
                         }
-                        file.flush().await?;
-                        debug!("Done streaming chunk {} to file", chunk_index);
-
-                        Ok(())
                     },
                     should_retry,
                 )
@@ -1025,6 +1100,7 @@ impl S3Client {
             );
         } else {
             let _ = tokio::fs::remove_file(&local_path_tmp).await;
+            // Do not finalize the file.
             error!("Download of {local_path} failed! Not finalizing the file.")
         }
 
@@ -1186,7 +1262,8 @@ impl S3Client {
                 .retry_strategy
                 .clone()
                 .delay_iterator_with_jitter(self.retry_config.max_retries);
-            let retriable = self.retry_config.retriable_client_status_codes.clone();
+            let retriable_client_status_codes =
+                self.retry_config.retriable_client_status_codes.clone();
             let client = self.inner.clone();
             let local_path = local_path.to_string();
             let bucket = bucket.to_string();
@@ -1228,7 +1305,7 @@ impl S3Client {
                         .send()
                         .await
                         .map_err(
-                            partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), retriable.as_slice(), _),
+                            partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), retriable_client_status_codes.as_slice(), _),
                         )?;
                         Ok((part_number, upload_part_output))
                     },
