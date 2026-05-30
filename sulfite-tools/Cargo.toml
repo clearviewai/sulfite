@@ -1,7 +1,7 @@
 [package]
 name = "sulfite-tools"
 version = "0.0.10"
-edition = "2021"
+edition = "2024"
 authors = ["Terence Liu <terence.liu@clearview.ai>"]
 description = "A high-level S3 client built on AWS SDK for Rust for bandwidth saturation (CLI tools)"
 license = "MIT"
