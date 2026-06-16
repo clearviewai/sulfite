@@ -72,7 +72,11 @@ Listing first 3...
 ```bash
 # Get metadata (HEAD) for one object
 --> sulfite head -b my-bucket -k my-object-1.txt
-ObjectInfo { key: "my-object-1.txt", size: 276480, timestamp: 2025-06-15T15:06:42Z, storage_class: Some("DEEP_ARCHIVE"), restore_status: None }
+  my-object-1.txt
+    size: 276480 (270.00K) timestamp: 2025-06-15T15:06:42Z storage_class: DEEP_ARCHIVE
+# If the object is being restored from archival storage, a restore_status is appended, e.g.:
+#     ... storage_class: DEEP_ARCHIVE restore_status: ONGOING
+#     ... storage_class: DEEP_ARCHIVE restore_status: EXPIRY:2026-06-18T00:00:00Z
 ```
 
 ```bash

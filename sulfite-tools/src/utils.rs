@@ -1,5 +1,45 @@
+use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::BufRead;
+use sulfite::ObjectInfo;
+
+/// Formats a byte count as a short human-readable string (e.g. `1.99G`, `6.36M`).
+pub fn human_size(size: u64) -> String {
+    let size_kb = size as f64 / 1024.0;
+    let size_mb = size_kb / 1024.0;
+    let size_gb = size_mb / 1024.0;
+    let size_tb = size_gb / 1024.0;
+    if size_tb > 1.0 {
+        format!("{:.2}T", size_tb)
+    } else if size_gb > 1.0 {
+        format!("{:.2}G", size_gb)
+    } else if size_mb > 1.0 {
+        format!("{:.2}M", size_mb)
+    } else {
+        format!("{:.2}K", size_kb)
+    }
+}
+
+/// Prints an object in the multi-line colored style used by `list`. `display_key` is the
+/// text shown as the header line; `restore_status` is only printed when present (LIST does
+/// not request it, so it is elided there).
+pub fn print_object_human(display_key: &str, obj: &ObjectInfo) {
+    println!("  {}", display_key.bold());
+    let mut line = format!(
+        "    {} {} ({}) {} {} {} {}",
+        "size:".blue(),
+        obj.size,
+        human_size(obj.size),
+        "timestamp:".blue(),
+        obj.timestamp,
+        "storage_class:".blue(),
+        obj.storage_class.as_deref().unwrap_or(""),
+    );
+    if let Some(rs) = obj.restore_status.as_deref() {
+        line.push_str(&format!(" {} {}", "restore_status:".blue(), rs));
+    }
+    println!("{line}");
+}
 
 /// Warns if a non-empty prefix does not end with '/'. Directory-style S3 keys usually
 /// use a trailing slash; omitting it can yield unexpected matches (e.g. "foo" matches

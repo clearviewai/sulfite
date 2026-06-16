@@ -5,7 +5,8 @@ use log::{debug, error, info, warn};
 use std::time::SystemTime;
 use sulfite::S3Client;
 use sulfite_tools::utils::{
-    get_keys_from_csv, get_line_count, make_progress_bar, warn_prefix_no_trailing_slash,
+    get_keys_from_csv, get_line_count, make_progress_bar, print_object_human,
+    warn_prefix_no_trailing_slash,
 };
 
 use crate::{CsvArgs, CsvCommand};
@@ -62,10 +63,12 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
                 let res: Result<(), anyhow::Error> = async {
                     match command {
                         CsvCommand::Head { bucket, prefix, suffix, .. } => {
-                            let key = format!("{prefix}{key}{suffix}");
-                            let obj = client.head_object(&bucket, &key).await
-                                .with_context(|| format!("heading key {key}"))?;
-                            println!("{obj:?}");
+                            let full_key = format!("{prefix}{key}{suffix}");
+                            let obj = client.head_object(&bucket, &full_key).await
+                                .with_context(|| format!("heading key {full_key}"))?;
+                            // Display the key as it appears in the CSV plus suffix (prefix omitted), matching `list`.
+                            let display_key = format!("{key}{suffix}");
+                            print_object_human(&display_key, &obj);
                         }
                         CsvCommand::Download { bucket, prefix, suffix, local_dir, .. } => {
                             let mut local_path = key.clone();

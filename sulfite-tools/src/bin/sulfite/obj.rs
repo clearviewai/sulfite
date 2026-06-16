@@ -2,13 +2,13 @@ use anyhow::Context;
 use sulfite::S3Client;
 
 use crate::ObjCommand;
-use sulfite_tools::utils::make_progress_bar;
+use sulfite_tools::utils::{make_progress_bar, print_object_human};
 
 pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()> {
     match command {
         ObjCommand::Head(a) => {
             let obj = client.head_object(&a.bucket, &a.key).await?;
-            println!("{:?}", obj);
+            print_object_human(&a.key, &obj);
         }
         ObjCommand::Download(a) => {
             let local_path = match &a.local_path {

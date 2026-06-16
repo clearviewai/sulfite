@@ -5,7 +5,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     error::{ErrorMetadata, ProvideErrorMetadata, SdkError},
     operation::list_objects_v2::ListObjectsV2Output,
-    primitives::{ByteStream, ByteStreamError, DateTime, Length},
+    primitives::{ByteStream, ByteStreamError, DateTime, DateTimeFormat, Length},
     types::{
         CompletedMultipartUpload, CompletedPart, GlacierJobParameters, RestoreRequest,
         StorageClass, Tier,
@@ -144,6 +144,12 @@ pub struct ObjectInfo {
     /// Last-modified time (AWS SDK `DateTime`).
     pub timestamp: DateTime,
     pub storage_class: Option<String>,
+    /// Normalized restore status:
+    /// - `None` — no restore status (object not restored and not being restored),
+    /// - `Some("ONGOING")` — a restore is currently in progress,
+    /// - `Some("EXPIRY:<ts>")` — a temporary restored copy is available until `<ts>` (RFC3339 UTC).
+    ///
+    /// Normalized identically whether the value came from the LIST or HEAD/GET API.
     pub restore_status: Option<String>,
 }
 
@@ -221,6 +227,41 @@ impl<'a> ListObjectsV2PageIter<'a> {
     }
 }
 
+/// Normalized restore status from the structured `RestoreStatus` returned by LIST.
+/// See [`ObjectInfo::restore_status`] for the possible values.
+fn normalize_restore_status_from_list(rs: Option<&aws_sdk_s3::types::RestoreStatus>) -> Option<String> {
+    let rs = rs?;
+    if rs.is_restore_in_progress == Some(true) {
+        Some("ONGOING".to_string())
+    } else if let Some(exp) = rs.restore_expiry_date() {
+        let ts = exp
+            .fmt(DateTimeFormat::DateTime)
+            .unwrap_or_else(|_| exp.to_string());
+        Some(format!("EXPIRY:{ts}"))
+    } else {
+        None
+    }
+}
+
+/// Normalized restore status from the raw `x-amz-restore` header returned by HEAD/GET.
+/// The header looks like `ongoing-request="true"` or
+/// `ongoing-request="false", expiry-date="Thu, 18 Jun 2026 00:00:00 GMT"`.
+/// See [`ObjectInfo::restore_status`] for the possible values.
+fn normalize_restore_status_from_header(restore: Option<&str>) -> Option<String> {
+    let restore = restore?;
+    if restore.contains("ongoing-request=\"true\"") {
+        return Some("ONGOING".to_string());
+    }
+    // Extract and reformat the expiry-date (an HTTP date) to RFC3339, matching the LIST path.
+    let marker = "expiry-date=\"";
+    let start = restore.find(marker)? + marker.len();
+    let rest = &restore[start..];
+    let end = rest.find('"')?;
+    let http_date = &rest[..end];
+    let dt = DateTime::from_str(http_date, DateTimeFormat::HttpDate).ok()?;
+    dt.fmt(DateTimeFormat::DateTime).ok().map(|ts| format!("EXPIRY:{ts}"))
+}
+
 /// Converts one SDK list_objects_v2 page into `(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)`.
 #[allow(clippy::result_large_err)]
 fn page_to_object_and_prefix_lists(
@@ -237,23 +278,7 @@ fn page_to_object_and_prefix_lists(
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
                 .to_owned(),
             storage_class: object.storage_class().map(|sc| sc.as_str().to_owned()),
-            restore_status: object.restore_status().map(|rs| {
-                let is_restoring = if let Some(is_restoring) = rs.is_restore_in_progress {
-                    if is_restoring {
-                        "Restoring"
-                    } else {
-                        "Restored"
-                    }
-                } else {
-                    "N/A"
-                };
-                let ts = rs.restore_expiry_date().map(|red| red.to_string());
-                format!(
-                    "{} (Expires: {})",
-                    is_restoring,
-                    ts.unwrap_or("N/A".to_owned())
-                )
-            }),
+            restore_status: normalize_restore_status_from_list(object.restore_status()),
         });
         Result::Ok(())
     })?;
@@ -640,7 +665,7 @@ impl S3Client {
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
                 .to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
-            restore_status: resp.restore().map(|rs| rs.to_owned()),
+            restore_status: normalize_restore_status_from_header(resp.restore()),
         };
         debug!("Found object with key={}", key);
         debug!("Content length: {}", object_info.size);
@@ -693,7 +718,7 @@ impl S3Client {
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
                 .to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
-            restore_status: resp.restore().map(|rs| rs.to_owned()),
+            restore_status: normalize_restore_status_from_header(resp.restore()),
         };
 
         debug!("Found object with key={}", key);
@@ -767,7 +792,7 @@ impl S3Client {
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
                 .to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
-            restore_status: resp.restore().map(|rs| rs.to_owned()),
+            restore_status: normalize_restore_status_from_header(resp.restore()),
         };
 
         let local_path = local_path.to_owned();
@@ -872,7 +897,7 @@ impl S3Client {
             size: file_size,
             timestamp: timestamp.to_owned(),
             storage_class: resp.storage_class().map(|sc| sc.as_str().to_owned()),
-            restore_status: resp.restore().map(|rs| rs.to_owned()),
+            restore_status: normalize_restore_status_from_header(resp.restore()),
         };
 
         if file_size == 0 {

@@ -1,6 +1,6 @@
 use colored::Colorize;
 use sulfite::S3Client;
-use sulfite_tools::utils::warn_prefix_no_trailing_slash;
+use sulfite_tools::utils::{print_object_human, warn_prefix_no_trailing_slash};
 
 use crate::ListArgs;
 
@@ -84,35 +84,8 @@ pub async fn run_list(client: S3Client, args: ListArgs) -> anyhow::Result<()> {
     }
     // Console display always strips the list prefix for readability (keep_prefix only affects CSV output).
     objects_to_display.iter().for_each(|obj| {
-        if let Some(s) = obj.key.strip_prefix(prefix.as_str()) {
-            println!("  {}", s.to_string().bold());
-        } else {
-            // should never happen
-            println!("  {}", obj.key.bold());
-        }
-        let size_kb = obj.size as f64 / 1024.0;
-        let size_mb = size_kb / 1024.0;
-        let size_gb = size_mb / 1024.0;
-        let size_tb = size_gb / 1024.0;
-        let size_human_str = if size_tb > 1.0 {
-            format!(" ({:.2}T)", size_tb)
-        } else if size_gb > 1.0 {
-            format!(" ({:.2}G)", size_gb)
-        } else if size_mb > 1.0 {
-            format!(" ({:.2}M)", size_mb)
-        } else {
-            format!(" ({:.2}K)", size_kb)
-        };
-        println!(
-            "    {} {}{} {} {} {} {}",
-            "size:".blue(),
-            obj.size,
-            size_human_str,
-            "timestamp:".blue(),
-            obj.timestamp,
-            "storage_class:".blue(),
-            obj.storage_class.as_deref().unwrap_or("")
-        );
+        let display_key = obj.key.strip_prefix(prefix.as_str()).unwrap_or(&obj.key);
+        print_object_human(display_key, obj);
     });
 
     println!("{}", "-----------------------------------".bold());
