@@ -256,7 +256,9 @@ pub async fn run_csv(client: S3Client, args: CsvArgs) -> anyhow::Result<()> {
         })
         .await;
 
-    if let Some(pb) = pb.as_ref() { pb.finish() }
+    if let Some(pb) = pb.as_ref() {
+        pb.finish()
+    }
 
     Ok(())
 }
