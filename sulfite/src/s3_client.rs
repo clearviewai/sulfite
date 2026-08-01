@@ -1,8 +1,10 @@
+use crate::multipart::{MultipartPlan, validate_content_range};
 use crate::retry_strategy::RetryStrategy;
 use crate::utils::generate_random_hex;
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
+    Client as AWSS3Client, Error as AWSS3Error,
     error::{ErrorMetadata, ProvideErrorMetadata, SdkError},
     operation::list_objects_v2::ListObjectsV2Output,
     primitives::{ByteStream, ByteStreamError, DateTime, DateTimeFormat, Length},
@@ -10,20 +12,15 @@ use aws_sdk_s3::{
         CompletedMultipartUpload, CompletedPart, GlacierJobParameters, RestoreRequest,
         StorageClass, Tier,
     },
-    Client as AWSS3Client, Error as AWSS3Error,
 };
 use bytes::Bytes;
 use core::str;
+use futures::{StreamExt, TryStreamExt, stream};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use partial_application::partial;
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::{
-    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
-    sync::Semaphore,
-};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio_retry::RetryIf;
 
 /// Default read timeout in seconds for the underlying HTTP client (boto default).
@@ -39,19 +36,27 @@ pub const DEFAULT_RETRIABLE_CLIENT_STATUS_CODES_STR: &str = "408,429";
 pub const FALLBACK_REGION: &str = "us-east-1";
 /// Buffer size for upload byte stream (1 MiB).
 pub const FILE_BUFFER_SIZE: usize = 1024 * 1024;
-/// Part size for multipart upload/download (20 MiB). Adaptive when file size would exceed MULTIPART_MAX_CHUNKS parts.
-pub const DEFAULT_MULTIPART_CHUNK_SIZE: u64 = 1024 * 1024 * 20;
-/// Number of parallel workers for multipart download/upload when not overridden per call (default: 1).
+/// Part size for multipart upload/download/copy (20 MiB). Uploads and copies constrain the
+/// effective size to 5 MiB through 5 GiB and adapt upward to stay within
+/// `MULTIPART_MAX_PARTS`.
+pub const DEFAULT_MULTIPART_PART_SIZE: u64 = 1024 * 1024 * 20;
+/// Number of parallel workers for multipart download/upload/copy when not overridden per call (default: 1).
 pub const DEFAULT_MULTIPART_N_WORKERS: usize = 1;
 /// S3 API limit on number of parts per multipart upload (10_000).
-pub const MULTIPART_MAX_CHUNKS: u64 = 10000;
+pub const MULTIPART_MAX_PARTS: u64 = 10000;
+/// S3 minimum size for every multipart upload part except the final part (5 MiB).
+pub const MULTIPART_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+/// S3 maximum size for one multipart upload part (5 GiB).
+pub const MULTIPART_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+/// S3 multipart object ceiling: 10,000 parts of 5 GiB each (marketed as 50 TB).
+pub const MULTIPART_MAX_OBJECT_SIZE: u64 = MULTIPART_MAX_PARTS * MULTIPART_MAX_PART_SIZE;
 
-/// Progress bar for multipart transfer (e.g. chunk count). Use with [`download_object_multipart`](S3Client::download_object_multipart) and [`upload_object_multipart`](S3Client::upload_object_multipart).
+/// Progress bar for multipart transfer (e.g. part count). Use with [`download_object_multipart`](S3Client::download_object_multipart), [`upload_object_multipart`](S3Client::upload_object_multipart), and [`copy_object_multipart`](S3Client::copy_object_multipart).
 /// When the `indicatif` feature is enabled, [`indicatif::ProgressBar`] implements this trait.
 pub trait ProgressBar: Send + Sync + Clone {
-    /// Set the total number of units (e.g. chunks).
+    /// Set the total number of units (e.g. parts).
     fn set_length(&self, len: u64);
-    /// Advance by `delta` units (e.g. one chunk completed).
+    /// Advance by `delta` units (e.g. one part completed).
     fn inc(&self, delta: u64);
     /// Mark the progress bar as finished.
     fn finish(&self);
@@ -89,9 +94,11 @@ pub struct S3ClientConfig {
     pub access_secret_session_tuple: Option<(String, String, Option<String>)>,
     /// Read timeout in seconds for the HTTP client (default: 60).
     pub read_timeout_secs: u64,
-    /// Part size for multipart upload/download in bytes (default: 20 MiB). Adaptive when file size would exceed MULTIPART_MAX_CHUNKS parts.
-    pub multipart_chunk_size: u64,
-    /// Number of parallel workers for multipart download/upload when not overridden per call (default: 1).
+    /// Part size for multipart upload/download/copy in bytes (default: 20 MiB). Uploads and copies
+    /// constrain the effective size to 5 MiB through 5 GiB and adapt upward to stay within
+    /// `MULTIPART_MAX_PARTS`.
+    pub multipart_part_size: u64,
+    /// Number of parallel workers for multipart download/upload/copy when not overridden per call (default: 1).
     pub multipart_n_workers: usize,
 }
 
@@ -103,7 +110,7 @@ impl Default for S3ClientConfig {
             profile_name: None,
             access_secret_session_tuple: None,
             read_timeout_secs: DEFAULT_READ_TIMEOUT,
-            multipart_chunk_size: DEFAULT_MULTIPART_CHUNK_SIZE,
+            multipart_part_size: DEFAULT_MULTIPART_PART_SIZE,
             multipart_n_workers: DEFAULT_MULTIPART_N_WORKERS,
         }
     }
@@ -229,7 +236,9 @@ impl<'a> ListObjectsV2PageIter<'a> {
 
 /// Normalized restore status from the structured `RestoreStatus` returned by LIST.
 /// See [`ObjectInfo::restore_status`] for the possible values.
-fn normalize_restore_status_from_list(rs: Option<&aws_sdk_s3::types::RestoreStatus>) -> Option<String> {
+fn normalize_restore_status_from_list(
+    rs: Option<&aws_sdk_s3::types::RestoreStatus>,
+) -> Option<String> {
     let rs = rs?;
     if rs.is_restore_in_progress == Some(true) {
         Some("ONGOING".to_string())
@@ -259,7 +268,9 @@ fn normalize_restore_status_from_header(restore: Option<&str>) -> Option<String>
     let end = rest.find('"')?;
     let http_date = &rest[..end];
     let dt = DateTime::from_str(http_date, DateTimeFormat::HttpDate).ok()?;
-    dt.fmt(DateTimeFormat::DateTime).ok().map(|ts| format!("EXPIRY:{ts}"))
+    dt.fmt(DateTimeFormat::DateTime)
+        .ok()
+        .map(|ts| format!("EXPIRY:{ts}"))
 }
 
 /// Converts one SDK list_objects_v2 page into `(Vec<ObjectInfo>, Vec<CommonPrefixInfo>)`.
@@ -272,7 +283,7 @@ fn page_to_object_and_prefix_lists(
     item.contents().iter().try_for_each(|object| {
         objects.push(ObjectInfo {
             key: object.key().ok_or(S3Error::FieldNotExist("key"))?.into(),
-            size: object.size().ok_or(S3Error::FieldNotExist("size"))? as u64,
+            size: checked_content_length(object.size())?,
             timestamp: object
                 .last_modified()
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
@@ -316,8 +327,15 @@ pub enum S3Error {
     OtherSDKError(String, AWSS3Error),
     #[error("{} [ByteStreamDownloadError - <{}>]", .0, .1)]
     ByteStreamDownloadError(String, ByteStreamError),
+    /// A local upload-body construction or file-read error. High-level retries intentionally do
+    /// not retry this variant because retrying cannot repair a missing, unreadable, or changed
+    /// local source file.
     #[error("{} [ByteStreamUploadError - <{}>]", .0, .1)]
     ByteStreamUploadError(String, ByteStreamError),
+    #[error("{} [UnexpectedContentLength - expected <{}>, received <{}>]", .0, .1, .2)]
+    UnexpectedContentLength(String, u64, u64),
+    #[error("{} [UnexpectedContentRange - expected <{}>, received <{}>]", .0, .1, .2)]
+    UnexpectedContentRange(String, String, String),
     #[error("{} [ValidationError]", .0)]
     ValidationError(String),
     #[error("{} [IOError]", .0)]
@@ -364,22 +382,20 @@ where
             S3Error::DispatchFailure(context)
         }
         SdkError::ResponseError(response_error) => {
-            if let Some(bytes) = response_error.raw().body().bytes() {
-                if let Ok(raw_content) = str::from_utf8(bytes) {
-                    if !raw_content.is_empty() {
-                        debug!("[ResponseError] raw {}", raw_content);
-                    }
-                }
+            if let Some(bytes) = response_error.raw().body().bytes()
+                && let Ok(raw_content) = str::from_utf8(bytes)
+                && !raw_content.is_empty()
+            {
+                debug!("[ResponseError] raw {}", raw_content);
             }
             S3Error::ResponseError(context)
         }
         SdkError::ServiceError(service_error) => {
-            if let Some(bytes) = service_error.raw().body().bytes() {
-                if let Ok(raw_content) = str::from_utf8(bytes) {
-                    if !raw_content.is_empty() {
-                        debug!("[ServiceError] raw {}", raw_content);
-                    }
-                }
+            if let Some(bytes) = service_error.raw().body().bytes()
+                && let Ok(raw_content) = str::from_utf8(bytes)
+                && !raw_content.is_empty()
+            {
+                debug!("[ServiceError] raw {}", raw_content);
             }
 
             let error_meta = e.meta().to_owned();
@@ -415,6 +431,35 @@ fn map_bytestream_upload_error(context: String, e: ByteStreamError) -> S3Error {
     S3Error::ByteStreamUploadError(context, e)
 }
 
+async fn finalize_download_file(
+    temporary_path: &str,
+    final_path: &str,
+    timestamp: DateTime,
+) -> Result<()> {
+    let temporary_path_owned = temporary_path.to_owned();
+    let final_path_owned = final_path.to_owned();
+    let finalize_result = match tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        filetime::set_file_mtime(
+            &temporary_path_owned,
+            filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
+        )?;
+        std::fs::rename(&temporary_path_owned, &final_path_owned)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result.map_err(S3Error::from),
+        Err(error) => Err(S3Error::RuntimeError(error.to_string())),
+    };
+
+    if finalize_result.is_err()
+        && let Err(cleanup_error) = tokio::fs::remove_file(temporary_path).await
+    {
+        warn!("Failed to remove temporary download file {temporary_path}: {cleanup_error}");
+    }
+    finalize_result
+}
+
 fn should_retry(e: &S3Error) -> bool {
     match e {
         S3Error::TimeoutError(_)
@@ -422,9 +467,15 @@ fn should_retry(e: &S3Error) -> bool {
         | S3Error::ResponseError(_)
         | S3Error::RetriableClientError(_, _, _, _)
         | S3Error::RetriableServerError(_, _, _, _)
-        | S3Error::ByteStreamDownloadError(_, _) => {
+        | S3Error::ByteStreamDownloadError(_, _)
+        | S3Error::UnexpectedContentLength(_, _, _)
+        | S3Error::UnexpectedContentRange(_, _, _) => {
             info!("RetryIf: {}. Retrying...", e);
             true
+        }
+        S3Error::ByteStreamUploadError(_, _) => {
+            debug!("RetryIf: local upload-body errors are not retriable: {}", e);
+            false
         }
         _ => {
             // other S3Error errors
@@ -436,11 +487,21 @@ fn should_retry(e: &S3Error) -> bool {
 
 pub type Result<T> = std::result::Result<T, S3Error>;
 
+#[allow(clippy::result_large_err)]
+pub(crate) fn checked_content_length(content_length: Option<i64>) -> Result<u64> {
+    let content_length = content_length.ok_or(S3Error::FieldNotExist("content_length"))?;
+    u64::try_from(content_length).map_err(|_| {
+        S3Error::ValidationError(format!(
+            "content length must not be negative: {content_length}"
+        ))
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Client {
     pub inner: AWSS3Client,
     retry_config: RetryConfig,
-    multipart_chunk_size: u64,
+    multipart_part_size: u64,
     multipart_n_workers: usize,
 }
 
@@ -493,18 +554,18 @@ impl S3Client {
         S3Client {
             inner: AWSS3Client::from_conf(config_builder.build()),
             retry_config,
-            multipart_chunk_size: config.multipart_chunk_size,
+            multipart_part_size: config.multipart_part_size,
             multipart_n_workers: config.multipart_n_workers,
         }
     }
 
     /// Build from an existing SDK client. Use [`RetryConfig::default`] for default AWS client retry behavior (no high-level retries from this crate).
     /// When both high-level (this crate) and low-level (SDK) retries are enabled, logs a warning (double retries).
-    /// Uses [`DEFAULT_MULTIPART_CHUNK_SIZE`] and [`DEFAULT_MULTIPART_N_WORKERS`] unless overridden.
+    /// Uses [`DEFAULT_MULTIPART_PART_SIZE`] and [`DEFAULT_MULTIPART_N_WORKERS`] unless overridden.
     pub fn new_with_aws_s3_client(
         aws_s3_client: AWSS3Client,
         retry_config: RetryConfig,
-        multipart_chunk_size: Option<u64>,
+        multipart_part_size: Option<u64>,
         multipart_n_workers: Option<usize>,
     ) -> Self {
         if retry_config.max_retries > 0 && aws_s3_client.config().retry_config().is_some() {
@@ -514,13 +575,47 @@ impl S3Client {
         S3Client {
             inner: aws_s3_client,
             retry_config,
-            multipart_chunk_size: multipart_chunk_size.unwrap_or(DEFAULT_MULTIPART_CHUNK_SIZE),
+            multipart_part_size: multipart_part_size.unwrap_or(DEFAULT_MULTIPART_PART_SIZE),
             multipart_n_workers: multipart_n_workers.unwrap_or(DEFAULT_MULTIPART_N_WORKERS),
         }
     }
 
-    /// Runs an operation with the client's retry policy (strategy + max_retries + should_retry).
-    async fn with_retry<F, Fut, T>(&self, op: F) -> Result<T>
+    /// Configured multipart part size in bytes.
+    pub fn multipart_part_size(&self) -> u64 {
+        self.multipart_part_size
+    }
+
+    /// Configured number of concurrent multipart workers.
+    pub fn multipart_n_workers(&self) -> usize {
+        self.multipart_n_workers
+    }
+
+    /// Maps an AWS SDK operation error using this client's retriable status-code configuration.
+    pub fn map_sdk_error<E>(&self, context: impl Into<String>, error: SdkError<E>) -> S3Error
+    where
+        AWSS3Error: From<SdkError<E>>,
+        E: ProvideErrorMetadata + std::fmt::Debug,
+    {
+        map_sdk_error(
+            context.into(),
+            &self.retry_config.retriable_client_status_codes,
+            error,
+        )
+    }
+
+    /// Maps an error encountered while collecting a downloaded byte stream.
+    pub fn map_bytestream_download_error(
+        &self,
+        context: impl Into<String>,
+        error: ByteStreamError,
+    ) -> S3Error {
+        map_bytestream_download_error(context.into(), error)
+    }
+
+    /// Runs an operation with this client's retry strategy, limit, and transient-error filtering.
+    ///
+    /// The closure may run more than once and must recreate any consumed request body each time.
+    pub async fn with_retry<F, Fut, T>(&self, op: F) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -542,7 +637,7 @@ impl S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(partial!(map_sdk_error => format!("<head_bucket> bucket={bucket}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
+            .map_err(|error| self.map_sdk_error(format!("<head_bucket> bucket={bucket}"), error))?;
         Ok(BucketInfo {
             name: bucket.into(),
             region: self.inner.config().region().map(|r| r.to_string()),
@@ -555,11 +650,9 @@ impl S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(partial!(
-                map_sdk_error => format!("<create_bucket> bucket={bucket}"),
-                self.retry_config.retriable_client_status_codes.as_slice(),
-                _
-            ))?;
+            .map_err(|error| {
+                self.map_sdk_error(format!("<create_bucket> bucket={bucket}"), error)
+            })?;
         Ok(())
     }
 
@@ -569,7 +662,9 @@ impl S3Client {
             .bucket(bucket)
             .send()
             .await
-            .map_err(partial!(map_sdk_error => format!("<delete_bucket> bucket={bucket}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
+            .map_err(|error| {
+                self.map_sdk_error(format!("<delete_bucket> bucket={bucket}"), error)
+            })?;
         Ok(())
     }
 
@@ -589,11 +684,12 @@ impl S3Client {
 
         let mut objects: Vec<ObjectInfo> = vec![];
         let mut common_prefixes: Vec<CommonPrefixInfo> = vec![];
-        while let Some(item) = pagination_stream
-            .try_next()
-            .await
-            .map_err(partial!(map_sdk_error => format!("<list_objects_v2_paginated> bucket={bucket} prefix={prefix}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?
-        {
+        while let Some(item) = pagination_stream.try_next().await.map_err(|error| {
+            self.map_sdk_error(
+                format!("<list_objects_v2_paginated> bucket={bucket} prefix={prefix}"),
+                error,
+            )
+        })? {
             let (mut objs, mut prefixes) = page_to_object_and_prefix_lists(&item)?;
             objects.append(&mut objs);
             common_prefixes.append(&mut prefixes);
@@ -651,15 +747,18 @@ impl S3Client {
                     .key(key)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<head_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
+                    .map_err(|error| {
+                        self.map_sdk_error(
+                            format!("<head_object> bucket={bucket} key={key}"),
+                            error,
+                        )
+                    })
             })
             .await?;
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: resp
-                .content_length()
-                .ok_or(S3Error::FieldNotExist("size"))? as u64,
+            size: checked_content_length(resp.content_length())?,
             timestamp: resp
                 .last_modified()
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
@@ -704,15 +803,13 @@ impl S3Client {
             builder = builder.range(range);
         }
 
-        let resp = builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<get_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
-        )?;
+        let resp = builder.send().await.map_err(|error| {
+            self.map_sdk_error(format!("<get_object> bucket={bucket} key={key}"), error)
+        })?;
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: resp
-                .content_length()
-                .ok_or(S3Error::FieldNotExist("size"))? as u64,
+            size: checked_content_length(resp.content_length())?,
             timestamp: resp
                 .last_modified()
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
@@ -735,8 +832,14 @@ impl S3Client {
             .body
             .collect()
             .await
-            .map_err(partial!(map_bytestream_download_error => format!("<get_object> bucket={bucket} key={key}"), _))?
-            .into_bytes().to_vec();
+            .map_err(|error| {
+                self.map_bytestream_download_error(
+                    format!("<get_object> bucket={bucket} key={key}"),
+                    error,
+                )
+            })?
+            .into_bytes()
+            .to_vec();
         Ok((object_info, content))
     }
 
@@ -778,15 +881,16 @@ impl S3Client {
             builder = builder.range(range);
         }
 
-        let mut resp = builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<download_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
-        )?;
+        let mut resp = builder.send().await.map_err(|error| {
+            self.map_sdk_error(
+                format!("<download_object> bucket={bucket} key={key}"),
+                error,
+            )
+        })?;
 
         let object_info = ObjectInfo {
             key: key.into(),
-            size: resp
-                .content_length()
-                .ok_or(S3Error::FieldNotExist("size"))? as u64,
+            size: checked_content_length(resp.content_length())?,
             timestamp: resp
                 .last_modified()
                 .ok_or(S3Error::FieldNotExist("timestamp"))?
@@ -803,43 +907,32 @@ impl S3Client {
         let random_suffix = generate_random_hex(8);
         let local_path_tmp = format!("{local_path}.{random_suffix}");
 
-        let result: Result<()> = async {
+        let transfer_result: Result<()> = async {
             let mut file = BufWriter::with_capacity(
                 FILE_BUFFER_SIZE,
                 tokio::fs::File::create(&local_path_tmp).await?,
             );
-            while let Some(bytes) = resp.body.try_next().await.map_err(
-                partial!(map_bytestream_download_error => format!("<download_object> bucket={bucket} key={key}"), _),
-            )? {
+            while let Some(bytes) = resp.body.try_next().await.map_err(|error| {
+                self.map_bytestream_download_error(
+                    format!("<download_object> bucket={bucket} key={key}"),
+                    error,
+                )
+            })? {
                 file.write_all(&bytes).await?;
             }
             file.flush().await?;
-            // Set the file mtime according to object timestamp.
-            tokio::task::spawn_blocking({
-                let local_path_tmp = local_path_tmp.clone();
-                move || {
-                    filetime::set_file_mtime(
-                        &local_path_tmp,
-                        filetime::FileTime::from_unix_time(
-                            timestamp.secs(),
-                            timestamp.subsec_nanos(),
-                        ),
-                    )?;
-                    std::fs::rename(&local_path_tmp, &local_path)?;
-                    Result::Ok(())
-                }
-            })
-            .await
-            .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
             Ok(())
         }
         .await;
 
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&local_path_tmp).await;
+        if let Err(transfer_error) = transfer_result {
+            if let Err(cleanup_error) = tokio::fs::remove_file(&local_path_tmp).await {
+                warn!("Failed to remove temporary download file {local_path_tmp}: {cleanup_error}");
+            }
+            return Err(transfer_error);
         }
-        result?;
 
+        finalize_download_file(&local_path_tmp, &local_path, timestamp).await?;
         Ok(object_info)
     }
 
@@ -872,6 +965,12 @@ impl S3Client {
     where
         P: ProgressBar + 'static,
     {
+        if self.multipart_n_workers == 0 {
+            return Err(S3Error::ValidationError(
+                "multipart workers must be greater than zero".to_owned(),
+            ));
+        }
+
         let resp = self
             .with_retry(|| async {
                 self.inner
@@ -880,13 +979,16 @@ impl S3Client {
                     .key(key)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
+                    .map_err(|error| {
+                        self.map_sdk_error(
+                            format!("<download_object_multipart> bucket={bucket} key={key}"),
+                            error,
+                        )
+                    })
             })
             .await?;
 
-        let file_size = resp
-            .content_length()
-            .ok_or(S3Error::FieldNotExist("size"))? as u64;
+        let file_size = checked_content_length(resp.content_length())?;
         let timestamp = resp
             .last_modified()
             .ok_or(S3Error::FieldNotExist("timestamp"))?
@@ -901,159 +1003,152 @@ impl S3Client {
         };
 
         if file_size == 0 {
-            let local_path_ = local_path.to_owned();
-            tokio::task::spawn_blocking(move || {
-                std::fs::File::create(&local_path_)?;
-                filetime::set_file_mtime(
-                    &local_path_,
-                    filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
-                )?;
-                Result::Ok(())
-            })
-            .await
-            .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
+            let local_path_tmp = format!("{local_path}.{}", generate_random_hex(8));
+            tokio::fs::File::create(&local_path_tmp).await?;
+            finalize_download_file(&local_path_tmp, local_path, timestamp).await?;
             debug!("Created blank file at {local_path}");
             return Ok(object_info);
         }
 
-        let chunk_size = self.multipart_chunk_size;
-        let mut chunk_count = (file_size / chunk_size) + 1;
-        let mut size_of_last_chunk = file_size % chunk_size;
-        if size_of_last_chunk == 0 {
-            size_of_last_chunk = chunk_size;
-            chunk_count -= 1;
-        }
-        debug!("Chunk count: {}", chunk_count);
+        let source_etag = resp
+            .e_tag()
+            .ok_or(S3Error::FieldNotExist("etag"))?
+            .to_owned();
+        let plan = MultipartPlan::for_download(file_size, self.multipart_part_size)?;
+        debug!("Part count: {}", plan.part_count);
         if let Some(p) = pb {
-            p.set_length(chunk_count as u64);
+            p.set_length(plan.part_count);
         }
 
-        let random_suffix = generate_random_hex(8);
-        let local_path_tmp = format!("{local_path}.{random_suffix}");
+        let local_path_tmp = format!("{local_path}.{}", generate_random_hex(8));
         let local_path_tmp_ = local_path_tmp.clone();
         tokio::fs::File::create(&local_path_tmp).await?;
 
         // parallel download
-        let sem = Arc::new(Semaphore::new(self.multipart_n_workers));
-        let mut join_set = tokio::task::JoinSet::new();
-        for chunk_index in 0..chunk_count {
-            let retry_iterator = self
-                .retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries);
-            let retriable = self.retry_config.retriable_client_status_codes.clone();
-            let client = self.inner.clone();
-            let local_path_tmp = local_path_tmp_.clone();
-            let bucket = bucket.to_string();
-            let key = key.to_string();
-            let pb = pb.map(|p| p.clone());
+        let transfer_result: Result<Vec<()>> = stream::iter(plan.parts())
+            .map(|part| {
+                let client = self.clone();
+                let local_path_tmp = local_path_tmp_.clone();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
+                let source_etag = source_etag.clone();
+                let pb = pb.cloned();
+                let part_index = part.number - 1;
 
-            let permit = Arc::clone(&sem).acquire_owned().await;
-            join_set.spawn(async move {
-                let _permit = permit; // consume semaphore
-
-                let this_chunk = if chunk_count - 1 == chunk_index {
-                    size_of_last_chunk
-                } else {
-                    chunk_size
-                };
-
-                let start_offset = chunk_index * chunk_size;
-                let end_offset = start_offset + this_chunk;
-
-                RetryIf::spawn(
-                    retry_iterator,
-                    || async {
-                        // end_offset is provided exclusive but the "end" of "bytes=start,end" is inclusive
-                        let range = format!("bytes={}-{}", start_offset, end_offset - 1);
-                        debug!("Getting chunk {} with range: {}", chunk_index, range);
-                        let mut resp = client
-                            .get_object()
-                            .bucket(&bucket)
-                            .key(&key)
-                            .range(range)
-                            .send()
-                            .await.map_err(
-                                partial!(map_sdk_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), retriable.as_slice(), _),
+                async move {
+                    client
+                        .with_retry(|| async {
+                            // end_offset is provided exclusive but the "end" of "bytes=start,end" is inclusive
+                            let range = format!("bytes={}-{}", part.start, part.end - 1);
+                            debug!("Getting part {} with range: {}", part_index, range);
+                            let mut resp = client
+                                .inner
+                                .get_object()
+                                .bucket(&bucket)
+                                .key(&key)
+                                .if_match(&source_etag)
+                                .range(range)
+                                .send()
+                                .await
+                                .map_err(|error| {
+                                    client.map_sdk_error(
+                                        format!(
+                                            "<download_object_multipart> bucket={bucket} \
+                                             key={key} download_part_index={part_index}"
+                                        ),
+                                        error,
+                                    )
+                                })?;
+                            debug!("Done getting part {}", part_index);
+                            validate_content_range(
+                                resp.content_range(),
+                                part,
+                                file_size,
+                                format!(
+                                    "<download_object_multipart> bucket={bucket} key={key} \
+                                     download_part_index={part_index}"
+                                ),
                             )?;
-                        debug!("Done getting chunk {}", chunk_index);
 
-                        let mut file = BufWriter::with_capacity(
-                            FILE_BUFFER_SIZE,
-                            tokio::fs::OpenOptions::new()
-                                .write(true)
-                                .open(&local_path_tmp).await?,
-                        );
-                        file.seek(std::io::SeekFrom::Start(start_offset)).await?;
+                            let mut file = BufWriter::with_capacity(
+                                FILE_BUFFER_SIZE,
+                                tokio::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&local_path_tmp)
+                                    .await?,
+                            );
+                            file.seek(std::io::SeekFrom::Start(part.start)).await?;
 
-                        debug!("Streaming chunk {} to file", chunk_index);
-                        while let Some(bytes) =
-                            resp.body.try_next().await.map_err(
-                            partial!(map_bytestream_download_error => format!("<download_object_multipart> bucket={bucket} key={key} download_chunk_index={chunk_index}"), _))?
-                        {
-                            file.write_all(&bytes).await?;
-                        }
-                        file.flush().await?;
-                        debug!("Done streaming chunk {} to file", chunk_index);
+                            debug!("Streaming part {} to file", part_index);
+                            let mut actual_length = 0_u64;
+                            while let Some(bytes) = resp.body.try_next().await.map_err(|error| {
+                                client.map_bytestream_download_error(
+                                    format!(
+                                        "<download_object_multipart> bucket={bucket} key={key} \
+                                         download_part_index={part_index}"
+                                    ),
+                                    error,
+                                )
+                            })? {
+                                let bytes_length = u64::try_from(bytes.len()).map_err(|error| {
+                                    S3Error::ValidationError(format!(
+                                        "downloaded part length cannot be represented as u64: \
+                                         {error}"
+                                    ))
+                                })?;
+                                actual_length =
+                                    actual_length.checked_add(bytes_length).ok_or_else(|| {
+                                        S3Error::UnexpectedContentLength(
+                                            format!(
+                                                "<download_object_multipart> bucket={bucket} \
+                                                 key={key} download_part_index={part_index}"
+                                            ),
+                                            part.length(),
+                                            u64::MAX,
+                                        )
+                                    })?;
+                                file.write_all(&bytes).await?;
+                            }
+                            file.flush().await?;
+                            if actual_length != part.length() {
+                                return Err(S3Error::UnexpectedContentLength(
+                                    format!(
+                                        "<download_object_multipart> bucket={bucket} key={key} \
+                                         download_part_index={part_index}"
+                                    ),
+                                    part.length(),
+                                    actual_length,
+                                ));
+                            }
+                            debug!("Done streaming part {} to file", part_index);
 
-                        Ok(())
-                    },
-                    should_retry,
-                )
-                .await?;
+                            Ok(())
+                        })
+                        .await?;
 
-                if let Some(p) = &pb {
-                    p.inc(1);
+                    if let Some(p) = &pb {
+                        p.inc(1);
+                    }
+                    Ok(())
                 }
-                Ok(())
-            });
-        }
-
-        // collect results
-        let mut res_ = Ok(object_info);
-        while let Some(res) = join_set.join_next().await {
-            if let Ok(res) = res {
-                if let Err(e) = res {
-                    // abort all tasks and break on first error encountered
-                    join_set.abort_all();
-                    res_ = Err(e);
-                    break;
-                }
-            } else {
-                // canceled
-                res_ = Err(S3Error::RuntimeError(format!(
-                    "Multipart download of {local_path} was canceled!"
-                )));
-                break;
-            }
-        }
-
-        if res_.is_ok() {
-            let local_path_ = local_path.to_owned();
-            // set the file mtime according to object timestamp
-            tokio::task::spawn_blocking(move || {
-                filetime::set_file_mtime(
-                    &local_path_tmp,
-                    filetime::FileTime::from_unix_time(timestamp.secs(), timestamp.subsec_nanos()),
-                )?;
-                std::fs::rename(&local_path_tmp, &local_path_)?;
-                Result::Ok(())
             })
-            .await
-            .map_err(|e| S3Error::RuntimeError(e.to_string()))??;
-            trace!(
-                "Downloaded multipart from s3://{}/{} to {}",
-                bucket,
-                key,
-                local_path
-            );
-        } else {
-            let _ = tokio::fs::remove_file(&local_path_tmp).await;
-            error!("Download of {local_path} failed! Not finalizing the file.")
+            .buffer_unordered(self.multipart_n_workers)
+            .try_collect()
+            .await;
+        if let Err(transfer_error) = transfer_result {
+            if let Err(cleanup_error) = tokio::fs::remove_file(&local_path_tmp).await {
+                warn!("Failed to remove temporary download file {local_path_tmp}: {cleanup_error}");
+            }
+            error!("Download of {local_path} failed! Not finalizing the file.");
+            return Err(transfer_error);
         }
 
-        res_
+        finalize_download_file(&local_path_tmp, local_path, timestamp).await?;
+        trace!(
+            "Downloaded multipart from s3://{}/{} to {}",
+            bucket, key, local_path
+        );
+        Ok(object_info)
     }
 
     async fn _put_object(
@@ -1070,9 +1165,9 @@ impl S3Client {
             builder = builder.storage_class(StorageClass::from(storage_class));
         }
 
-        builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<put_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
-        )?;
+        builder.send().await.map_err(|error| {
+            self.map_sdk_error(format!("<put_object> bucket={bucket} key={key}"), error)
+        })?;
 
         Ok(())
     }
@@ -1108,18 +1203,21 @@ impl S3Client {
             .buffer_size(FILE_BUFFER_SIZE)
             .build()
             .await
-            .map_err(
-            partial!(map_bytestream_upload_error => format!("<upload_object> bucket={bucket} key={key}"), _),
-        )?;
+            .map_err(|error| {
+                map_bytestream_upload_error(
+                    format!("<upload_object> bucket={bucket} key={key}"),
+                    error,
+                )
+            })?;
         let mut builder = self.inner.put_object().bucket(bucket).key(key).body(body);
 
         if let Some(storage_class) = storage_class {
             builder = builder.storage_class(StorageClass::from(storage_class));
         }
 
-        builder.send().await.map_err(
-            partial!(map_sdk_error => format!("<upload_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _),
-        )?;
+        builder.send().await.map_err(|error| {
+            self.map_sdk_error(format!("<upload_object> bucket={bucket} key={key}"), error)
+        })?;
 
         Ok(())
     }
@@ -1153,184 +1251,137 @@ impl S3Client {
     where
         P: ProgressBar + 'static,
     {
+        if self.multipart_n_workers == 0 {
+            return Err(S3Error::ValidationError(
+                "multipart workers must be greater than zero".to_owned(),
+            ));
+        }
+
         let file_size = tokio::fs::metadata(local_path).await?.len();
         if file_size == 0 {
-            self.put_object(bucket, key, vec![].as_slice(), storage_class)
-                .await?;
+            self.put_object(bucket, key, &[], storage_class).await?;
             return Ok(());
         }
 
-        // create the multipart upload
-        let create_multipart_upload_output = self
-            .with_retry(|| async {
-                let mut builder = self
-                    .inner
-                    .create_multipart_upload()
-                    .bucket(bucket)
-                    .key(key);
+        let plan = MultipartPlan::for_upload(file_size, self.multipart_part_size)?;
+        if plan.part_size != self.multipart_part_size {
+            info!(
+                "Object requires adaptive multipart upload part size {}.",
+                plan.part_size
+            );
+        }
 
-                if let Some(storage_class) = storage_class {
-                    builder = builder.storage_class(StorageClass::from(storage_class));
-                }
-
-                builder
-                    .send()
-                    .await
-                    .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
-            })
-            .await?;
+        // CreateMultipartUpload has no idempotency token. Avoid adding high-level retries that can
+        // create multiple orphaned uploads when S3 commits the request but its response is lost.
+        let mut builder = self.inner.create_multipart_upload().bucket(bucket).key(key);
+        if let Some(storage_class) = storage_class {
+            builder = builder.storage_class(StorageClass::from(storage_class));
+        }
+        let create_multipart_upload_output = builder.send().await.map_err(|error| {
+            self.map_sdk_error(
+                format!("<upload_object_multipart> bucket={bucket} key={key}"),
+                error,
+            )
+        })?;
 
         let upload_id = create_multipart_upload_output
             .upload_id()
             .ok_or(S3Error::FieldNotExist("upload_id"))?;
 
-        // Prepare the file to upload - chunking scheme. Adaptive size keeps part count <= MULTIPART_MAX_CHUNKS.
-        let mut multipart_chunk_size = self.multipart_chunk_size;
-        if file_size > multipart_chunk_size * MULTIPART_MAX_CHUNKS {
-            multipart_chunk_size = file_size / (MULTIPART_MAX_CHUNKS - 1);
-            info!("File size larger than 200GB. Using adaptive chunk size {multipart_chunk_size}.");
-        }
-
-        let mut chunk_count = (file_size / multipart_chunk_size) + 1;
-        let mut size_of_last_chunk = file_size % multipart_chunk_size;
-        if size_of_last_chunk == 0 {
-            size_of_last_chunk = multipart_chunk_size;
-            chunk_count -= 1;
-        }
-        debug!("Chunk count: {}", chunk_count);
+        debug!("Part count: {}", plan.part_count);
         if let Some(p) = pb {
-            p.set_length(chunk_count as u64);
+            p.set_length(plan.part_count);
         }
 
         // parallel upload
-        let sem = Arc::new(Semaphore::new(self.multipart_n_workers));
-        let mut join_set = tokio::task::JoinSet::new();
-        for chunk_index in 0..chunk_count {
-            let retry_iterator = self
-                .retry_config
-                .retry_strategy
-                .clone()
-                .delay_iterator_with_jitter(self.retry_config.max_retries);
-            let retriable = self.retry_config.retriable_client_status_codes.clone();
-            let client = self.inner.clone();
-            let local_path = local_path.to_string();
-            let bucket = bucket.to_string();
-            let key = key.to_string();
-            let upload_id = upload_id.to_string();
-            let pb = pb.map(|p| p.clone());
+        let transfer_result: Result<Vec<CompletedPart>> = stream::iter(plan.parts())
+            .map(|part| {
+                let client = self.clone();
+                let local_path = local_path.to_string();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
+                let upload_id = upload_id.to_string();
+                let pb = pb.cloned();
+                let part_index = part.number - 1;
 
-            let permit = Arc::clone(&sem).acquire_owned().await;
-            join_set.spawn(async move {
-                let _permit = permit; // consume semaphore
-
-                let this_chunk = if chunk_count - 1 == chunk_index {
-                    size_of_last_chunk
-                } else {
-                    multipart_chunk_size
-                };
-
-                let (part_number, upload_part_output) = RetryIf::spawn(
-                    retry_iterator,
-                    || async {
-
-                    let body = ByteStream::read_from()
-                        .path(&local_path)
-                        .buffer_size(FILE_BUFFER_SIZE)
-                        .offset(chunk_index * multipart_chunk_size)
-                        .length(Length::Exact(this_chunk))
-                        .build()
-                        .await.map_err(partial!(map_bytestream_upload_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), _))?;
-
-                    // Chunk index needs to start at 0, but part numbers start at 1.
-                    let part_number = (chunk_index as i32) + 1;
+                async move {
+                    let part_number = part.number;
                     let upload_part_output = client
-                        .upload_part()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .upload_id(&upload_id)
-                        .body(body)
-                        .part_number(part_number)
-                        .send()
-                        .await
-                        .map_err(
-                            partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key} upload_chunk_index={chunk_index}"), retriable.as_slice(), _),
-                        )?;
-                        Ok((part_number, upload_part_output))
-                    },
-                    should_retry,
-                )
-                .await?;
+                        .with_retry(|| async {
+                            let body = ByteStream::read_from()
+                                .path(&local_path)
+                                .buffer_size(FILE_BUFFER_SIZE)
+                                .offset(part.start)
+                                .length(Length::Exact(part.length()))
+                                .build()
+                                .await
+                                .map_err(|error| {
+                                    map_bytestream_upload_error(
+                                        format!(
+                                            "<upload_object_multipart> bucket={bucket} key={key} \
+                                             upload_part_index={part_index}"
+                                        ),
+                                        error,
+                                    )
+                                })?;
 
-                if let Some(p) = &pb {
-                    p.inc(1);
-                }
-                Ok((
-                    upload_part_output.e_tag.ok_or(S3Error::FieldNotExist("etag"))?,
-                    part_number,
-                ))
-            });
-        }
-
-        // collect results
-        let mut upload_parts: Vec<CompletedPart> = Vec::new();
-        let mut res_ = Ok(());
-        while let Some(res) = join_set.join_next().await {
-            if let Ok(res) = res {
-                match res {
-                    Ok((e_tag, part_number)) => {
-                        upload_parts.push(
-                            CompletedPart::builder()
-                                .e_tag(e_tag)
+                            client
+                                .inner
+                                .upload_part()
+                                .bucket(&bucket)
+                                .key(&key)
+                                .upload_id(&upload_id)
+                                .body(body)
                                 .part_number(part_number)
-                                .build(),
-                        );
-                    }
-                    Err(e) => {
-                        // abort all tasks and break on first error encountered
-                        join_set.abort_all();
-                        res_ = Err(e);
-                        break;
-                    }
-                }
-            } else {
-                // canceled
-                res_ = Err(S3Error::RuntimeError(format!(
-                    "Multipart upload of {local_path} was canceled!"
-                )));
-                break;
-            }
-        }
+                                .send()
+                                .await
+                                .map_err(|error| {
+                                    client.map_sdk_error(
+                                        format!(
+                                            "<upload_object_multipart> bucket={bucket} key={key} \
+                                             upload_part_index={part_index}"
+                                        ),
+                                        error,
+                                    )
+                                })
+                        })
+                        .await?;
 
-        // evaluate errors and send abort multipart upload request if error
-        let abort = || async {
-            let _ = self.inner
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
-                .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _));
+                    if let Some(p) = &pb {
+                        p.inc(1);
+                    }
+                    Ok(CompletedPart::builder()
+                        .e_tag(
+                            upload_part_output
+                                .e_tag
+                                .ok_or(S3Error::FieldNotExist("etag"))?,
+                        )
+                        .part_number(part_number)
+                        .build())
+                }
+            })
+            .buffer_unordered(self.multipart_n_workers)
+            .try_collect()
+            .await;
+        let mut upload_parts = match transfer_result {
+            Ok(parts) => parts,
+            Err(error) => {
+                error!(
+                    "<upload_object_multipart> bucket={bucket} key={key} Failed to upload all parts! Abort multipart upload."
+                );
+                if let Err(abort_error) = self.abort_multipart_upload(bucket, key, upload_id).await
+                {
+                    error!(
+                        "<upload_object_multipart> Failed to abort multipart upload \
+                         bucket={bucket} key={key} upload_id={upload_id}: {abort_error}"
+                    );
+                }
+                return Err(error);
+            }
         };
 
-        // in case of any error with early loop break
-        if let Err(e) = res_ {
-            error!("<upload_object_multipart> bucket={bucket} key={key} Failed to upload all parts! Abort multipart upload.");
-            abort().await;
-            return Err(e);
-        }
-
-        // if not it would indicate logical error
-        if upload_parts.len() != chunk_count as usize {
-            error!("<upload_object_multipart> bucket={bucket} key={key} Chunk count not lined up! Abort multipart upload.");
-            abort().await;
-            return Err(S3Error::RuntimeError(
-                "Failed to upload all parts!".to_string(),
-            ));
-        }
-
         // sort by part number
-        upload_parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
+        upload_parts.sort_by_key(|part| part.part_number);
 
         // complete multipart upload
         let client = self.inner.clone();
@@ -1349,14 +1400,26 @@ impl S3Client {
                     .upload_id(upload_id)
                     .send()
                     .await
-                    .map_err(partial!(map_sdk_error => format!("<upload_object_multipart> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))?;
+                    .map_err(|error| {
+                        self.map_sdk_error(
+                            format!("<upload_object_multipart> bucket={bucket} key={key}"),
+                            error,
+                        )
+                    })?;
                 Ok(complete_multipart_upload_output)
             })
             .await;
 
         if let Err(e) = complete_multipart_upload_res {
-            error!("<upload_object_multipart> bucket={bucket} key={key} Failed to complete multipart upload! Abort multipart upload.");
-            abort().await;
+            error!(
+                "<upload_object_multipart> bucket={bucket} key={key} Failed to complete multipart upload! Abort multipart upload."
+            );
+            if let Err(abort_error) = self.abort_multipart_upload(bucket, key, upload_id).await {
+                error!(
+                    "<upload_object_multipart> Failed to abort multipart upload \
+                     bucket={bucket} key={key} upload_id={upload_id}: {abort_error}"
+                );
+            }
             return Err(e);
         }
 
@@ -1368,19 +1431,25 @@ impl S3Client {
         Ok(())
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
-        self.with_retry(|| async {
-            self.inner
-                .delete_object()
-                .bucket(bucket)
-                .key(key)
-                .send()
-                .await
-                .map_err(partial!(map_sdk_error => format!("<delete_object> bucket={bucket} key={key}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
-        })
-        .await?;
+    /// Copies an object across independently configured S3 clients through memory.
+    pub async fn copy_object_cross_clients(
+        &self,
+        dst_client: &S3Client,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        dst_storage_class: Option<&str>,
+    ) -> Result<()> {
+        let (_, content) = self.get_object(src_bucket, src_key, None).await?;
+        dst_client
+            .put_object(dst_bucket, dst_key, &content, dst_storage_class)
+            .await?;
 
-        trace!("Deleted s3://{}/{}", bucket, key);
+        trace!(
+            "Copied through memory from s3://{}/{} to s3://{}/{} (dst_storage_class={:?})",
+            src_bucket, src_key, dst_bucket, dst_key, dst_storage_class
+        );
         Ok(())
     }
 
@@ -1390,36 +1459,307 @@ impl S3Client {
         src_key: &str,
         dst_bucket: &str,
         dst_key: &str,
-        storage_class: Option<&str>,
+        dst_storage_class: Option<&str>,
     ) -> Result<()> {
         self.with_retry(|| async {
-            let mut builder = self.inner
+            let mut builder = self
+                .inner
                 .copy_object()
                 .bucket(dst_bucket)
                 .key(dst_key)
                 .copy_source(urlencoding::encode(&format!("{}/{}", src_bucket, src_key)));
 
-            if let Some(storage_class) = storage_class {
-                let storage_class = StorageClass::from(storage_class);
-                builder = builder.storage_class(storage_class);
+            if let Some(dst_storage_class) = dst_storage_class {
+                let dst_storage_class = StorageClass::from(dst_storage_class);
+                builder = builder.storage_class(dst_storage_class);
             }
 
-            builder
-                .send()
-                .await
-                .map_err(partial!(map_sdk_error => format!("<copy_object> src_bucket={src_bucket} src_key={src_key} dst_bucket={dst_bucket} dst_key={dst_key} storage_class={:?}", storage_class), self.retry_config.retriable_client_status_codes.as_slice(), _))
+            builder.send().await.map_err(|error| {
+                self.map_sdk_error(
+                    format!(
+                        "<copy_object> src_bucket={src_bucket} src_key={src_key} \
+                             dst_bucket={dst_bucket} dst_key={dst_key} \
+                             dst_storage_class={dst_storage_class:?}"
+                    ),
+                    error,
+                )
+            })
         })
         .await?;
 
         trace!(
-            "Copied s3://{}/{} to s3://{}/{} (storage_class={:?})",
-            src_bucket,
-            src_key,
-            dst_bucket,
-            dst_key,
-            storage_class
+            "Copied s3://{}/{} to s3://{}/{} (dst_storage_class={:?})",
+            src_bucket, src_key, dst_bucket, dst_key, dst_storage_class
         );
 
+        Ok(())
+    }
+
+    /// Copies an object within one S3 backend using server-side ranged multipart copies.
+    ///
+    /// The object data does not pass through this process. The source must be addressable by the
+    /// destination backend and accessible with this client's credentials.
+    pub async fn copy_object_multipart<P>(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        dst_storage_class: Option<&str>,
+        pb: Option<&P>,
+    ) -> Result<()>
+    where
+        P: ProgressBar + 'static,
+    {
+        if self.multipart_n_workers == 0 {
+            return Err(S3Error::ValidationError(
+                "multipart workers must be greater than zero".to_owned(),
+            ));
+        }
+
+        let head = self
+            .with_retry(|| async {
+                self.inner
+                    .head_object()
+                    .bucket(src_bucket)
+                    .key(src_key)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        self.map_sdk_error(
+                            format!(
+                                "<copy_object_multipart> src_bucket={src_bucket} \
+                                 src_key={src_key} dst_bucket={dst_bucket} dst_key={dst_key}"
+                            ),
+                            error,
+                        )
+                    })
+            })
+            .await?;
+
+        let object_size = checked_content_length(head.content_length())?;
+
+        if object_size == 0 {
+            self.put_object(dst_bucket, dst_key, &[], dst_storage_class)
+                .await?;
+            return Ok(());
+        }
+
+        let source_etag = head
+            .e_tag()
+            .ok_or(S3Error::FieldNotExist("etag"))?
+            .to_owned();
+        let plan = MultipartPlan::for_upload(object_size, self.multipart_part_size)?;
+        if plan.part_size != self.multipart_part_size {
+            info!(
+                "Object requires adaptive multipart copy part size {}.",
+                plan.part_size
+            );
+        }
+
+        // CreateMultipartUpload has no idempotency token; do not add high-level retries.
+        let mut builder = self
+            .inner
+            .create_multipart_upload()
+            .bucket(dst_bucket)
+            .key(dst_key);
+        if let Some(dst_storage_class) = dst_storage_class {
+            builder = builder.storage_class(StorageClass::from(dst_storage_class));
+        }
+        let create_multipart_upload_output = builder.send().await.map_err(|error| {
+            self.map_sdk_error(
+                format!(
+                    "<copy_object_multipart> src_bucket={src_bucket} src_key={src_key} \
+                     dst_bucket={dst_bucket} dst_key={dst_key}"
+                ),
+                error,
+            )
+        })?;
+
+        let upload_id = create_multipart_upload_output
+            .upload_id()
+            .ok_or(S3Error::FieldNotExist("upload_id"))?;
+
+        debug!("Part count: {}", plan.part_count);
+        if let Some(p) = pb {
+            p.set_length(plan.part_count);
+        }
+
+        let transfer_result: Result<Vec<CompletedPart>> = stream::iter(plan.parts())
+            .map(|part| {
+                let client = self.clone();
+                let src_bucket = src_bucket.to_owned();
+                let src_key = src_key.to_owned();
+                let dst_bucket = dst_bucket.to_owned();
+                let dst_key = dst_key.to_owned();
+                let copy_source =
+                    urlencoding::encode(&format!("{src_bucket}/{src_key}")).into_owned();
+                let source_etag = source_etag.clone();
+                let upload_id = upload_id.to_owned();
+                let pb = pb.cloned();
+                let part_index = part.number - 1;
+
+                async move {
+                    let part_number = part.number;
+                    let upload_part_copy_output = client
+                        .with_retry(|| async {
+                            let range = format!("bytes={}-{}", part.start, part.end - 1);
+                            debug!(
+                                "Copying part {} with range {} server-side",
+                                part_index, range
+                            );
+                            client
+                                .inner
+                                .upload_part_copy()
+                                .bucket(&dst_bucket)
+                                .key(&dst_key)
+                                .upload_id(&upload_id)
+                                .part_number(part_number)
+                                .copy_source(&copy_source)
+                                .copy_source_if_match(&source_etag)
+                                .copy_source_range(range)
+                                .send()
+                                .await
+                                .map_err(|error| {
+                                    client.map_sdk_error(
+                                        format!(
+                                            "<copy_object_multipart> src_bucket={src_bucket} \
+                                             src_key={src_key} dst_bucket={dst_bucket} \
+                                             dst_key={dst_key} copy_part_index={part_index}"
+                                        ),
+                                        error,
+                                    )
+                                })
+                        })
+                        .await?;
+
+                    if let Some(p) = &pb {
+                        p.inc(1);
+                    }
+                    Ok(CompletedPart::builder()
+                        .e_tag(
+                            upload_part_copy_output
+                                .copy_part_result()
+                                .and_then(|result| result.e_tag())
+                                .ok_or(S3Error::FieldNotExist("etag"))?,
+                        )
+                        .part_number(part_number)
+                        .build())
+                }
+            })
+            .buffer_unordered(self.multipart_n_workers)
+            .try_collect()
+            .await;
+        let mut upload_parts = match transfer_result {
+            Ok(parts) => parts,
+            Err(error) => {
+                error!(
+                    "<copy_object_multipart> Failed to copy all parts; aborting multipart upload."
+                );
+                if let Err(abort_error) = self
+                    .abort_multipart_upload(dst_bucket, dst_key, upload_id)
+                    .await
+                {
+                    error!(
+                        "<copy_object_multipart> Failed to abort multipart upload \
+                         bucket={dst_bucket} key={dst_key} upload_id={upload_id}: {abort_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        upload_parts.sort_by_key(|part| part.part_number);
+        let complete_result = self
+            .with_retry(|| async {
+                self.inner
+                    .complete_multipart_upload()
+                    .bucket(dst_bucket)
+                    .key(dst_key)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .set_parts(Some(upload_parts.clone()))
+                            .build(),
+                    )
+                    .upload_id(upload_id)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        self.map_sdk_error(
+                            format!(
+                                "<copy_object_multipart> src_bucket={src_bucket} \
+                                 src_key={src_key} dst_bucket={dst_bucket} dst_key={dst_key}"
+                            ),
+                            error,
+                        )
+                    })
+            })
+            .await;
+
+        if let Err(error) = complete_result {
+            error!("<copy_object_multipart> Failed to complete copy; aborting multipart upload.");
+            if let Err(abort_error) = self
+                .abort_multipart_upload(dst_bucket, dst_key, upload_id)
+                .await
+            {
+                error!(
+                    "<copy_object_multipart> Failed to abort multipart upload \
+                     bucket={dst_bucket} key={dst_key} upload_id={upload_id}: {abort_error}"
+                );
+            }
+            return Err(error);
+        }
+
+        trace!(
+            "Copied multipart server-side from s3://{}/{} to s3://{}/{}",
+            src_bucket, src_key, dst_bucket, dst_key
+        );
+        Ok(())
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<()> {
+        self.with_retry(|| async {
+            self.inner
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .map_err(|error| {
+                    self.map_sdk_error(
+                        format!(
+                            "<abort_multipart_upload> bucket={bucket} key={key} \
+                             upload_id={upload_id}"
+                        ),
+                        error,
+                    )
+                })
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        self.with_retry(|| async {
+            self.inner
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|error| {
+                    self.map_sdk_error(format!("<delete_object> bucket={bucket} key={key}"), error)
+                })
+        })
+        .await?;
+
+        trace!("Deleted s3://{}/{}", bucket, key);
         Ok(())
     }
 
@@ -1431,9 +1771,15 @@ impl S3Client {
         tier: &str,
     ) -> Result<()> {
         self.with_retry(|| async {
-            let restore_request = RestoreRequest::builder().days(days).glacier_job_parameters(
-                GlacierJobParameters::builder().tier(Tier::from(tier)).build().map_err(|e| S3Error::ValidationError(e.to_string()))?
-            ).build();
+            let restore_request = RestoreRequest::builder()
+                .days(days)
+                .glacier_job_parameters(
+                    GlacierJobParameters::builder()
+                        .tier(Tier::from(tier))
+                        .build()
+                        .map_err(|e| S3Error::ValidationError(e.to_string()))?,
+                )
+                .build();
             self.inner
                 .restore_object()
                 .bucket(bucket)
@@ -1441,18 +1787,34 @@ impl S3Client {
                 .restore_request(restore_request)
                 .send()
                 .await
-                .map_err(partial!(map_sdk_error => format!("<restore_object> bucket={bucket} key={key} days={days} tier={tier}"), self.retry_config.retriable_client_status_codes.as_slice(), _))
+                .map_err(|error| {
+                    self.map_sdk_error(
+                        format!(
+                            "<restore_object> bucket={bucket} key={key} days={days} tier={tier}"
+                        ),
+                        error,
+                    )
+                })
         })
         .await?;
 
         trace!(
             "Restored s3://{}/{} (days={}, tier={})",
-            bucket,
-            key,
-            days,
-            tier
+            bucket, key, days, tier
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_content_length;
+
+    #[test]
+    fn validates_content_length() {
+        assert_eq!(checked_content_length(Some(42)).unwrap(), 42);
+        assert!(checked_content_length(Some(-1)).is_err());
+        assert!(checked_content_length(None).is_err());
     }
 }

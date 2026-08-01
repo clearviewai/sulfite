@@ -1,5 +1,5 @@
 use anyhow::Context;
-use sulfite::S3Client;
+use sulfite::{S3Client, copy_object_multipart_cross_clients};
 
 use crate::ObjCommand;
 use sulfite_tools::utils::{make_progress_bar, print_object_human};
@@ -65,9 +65,38 @@ pub async fn run_obj(client: S3Client, command: ObjCommand) -> anyhow::Result<()
                     &a.src_key,
                     &a.dst_bucket,
                     &a.dst_key,
-                    a.storage_class.as_deref(),
+                    a.dst_storage_class.as_deref(),
                 )
                 .await?;
+        }
+        ObjCommand::CopyMultipart(a) => {
+            let pb = make_progress_bar(Some(0));
+            client
+                .copy_object_multipart(
+                    &a.src_bucket,
+                    &a.src_key,
+                    &a.dst_bucket,
+                    &a.dst_key,
+                    a.dst_storage_class.as_deref(),
+                    Some(&pb),
+                )
+                .await?;
+            pb.finish();
+        }
+        ObjCommand::CopyMultipartCrossClients { args, dst_client } => {
+            let pb = make_progress_bar(Some(0));
+            copy_object_multipart_cross_clients(
+                &client,
+                &dst_client,
+                &args.src_bucket,
+                &args.src_key,
+                &args.dst_bucket,
+                &args.dst_key,
+                args.dst_storage_class.as_deref(),
+                Some(&pb),
+            )
+            .await?;
+            pb.finish();
         }
         ObjCommand::Restore(a) => {
             client

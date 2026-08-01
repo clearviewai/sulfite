@@ -9,7 +9,7 @@
 use std::process::Command;
 use std::sync::Once;
 
-use sulfite::{generate_random_hex, RetryConfig, S3Client, S3ClientConfig};
+use sulfite::{RetryConfig, S3Client, S3ClientConfig, generate_random_hex};
 
 const DEFAULT_LOCALSTACK_ENDPOINT: &str = "http://localhost:4566";
 const TEST_BUCKET: &str = "sulfite-test-bucket";
@@ -231,6 +231,57 @@ async fn cli_copy_then_head() {
     let _ = client.delete_object(TEST_BUCKET, &dst_key).await;
 }
 
+// Put a multi-part object via the library, copy it across clients with concurrent ranged
+// transfers, then verify the destination bytes.
+#[tokio::test]
+#[ignore = "requires LocalStack (run with: cargo test -p sulfite-tools --test localstack_cli -- --ignored)"]
+async fn cli_copy_multipart_cross_clients() {
+    let client = make_client().await;
+    ensure_bucket(&client, TEST_BUCKET).await;
+    let run = generate_random_hex(RANDOM_HEX_LEN);
+    let src_key = format!("cli-copy-multipart/{}/src", run);
+    let dst_key = format!("cli-copy-multipart/{}/dst", run);
+    let body: Vec<u8> = (0..(21 * 1024 * 1024 + 123))
+        .map(|index| (index % 251) as u8)
+        .collect();
+
+    client
+        .put_object(TEST_BUCKET, &src_key, &body, None)
+        .await
+        .expect("put source object");
+
+    let destination_endpoint = localstack_endpoint();
+    let (ok, _stdout, stderr) = run_cli(&[
+        "--multipart-part-size",
+        "5242880",
+        "--multipart-workers",
+        "2",
+        "copy-multipart-cross-clients",
+        "--src-bucket",
+        TEST_BUCKET,
+        "--src-key",
+        &src_key,
+        "--dst-bucket",
+        TEST_BUCKET,
+        "--dst-key",
+        &dst_key,
+        "--dst-endpoint-url",
+        &destination_endpoint,
+        "--dst-region",
+        "us-east-1",
+    ]);
+    assert!(ok, "CLI multipart copy failed: stderr={stderr}");
+
+    let (_, copied) = client
+        .get_object(TEST_BUCKET, &dst_key, None)
+        .await
+        .expect("get copied object");
+    assert_eq!(copied, body);
+
+    let _ = client.delete_object(TEST_BUCKET, &src_key).await;
+    let _ = client.delete_object(TEST_BUCKET, &dst_key).await;
+}
+
 // Put object via library, CLI delete, head via library must 404
 #[tokio::test]
 #[ignore = "requires LocalStack (run with: cargo test -p sulfite-tools --test localstack_cli -- --ignored)"]
@@ -365,6 +416,7 @@ async fn cli_csv_list_then_download() {
     let (ok_dl, _stdout, stderr_dl) = run_cli(&[
         "csv",
         manifest_s,
+        "--has-header",
         "download",
         "--bucket",
         TEST_BUCKET,
@@ -439,4 +491,70 @@ async fn cli_csv_upload_then_head() {
         let _ = client.delete_object(TEST_BUCKET, &key).await;
     }
     let _ = std::fs::remove_dir_all(&base).ok();
+}
+
+// CSV workflow: copy small objects through independently configured clients.
+#[tokio::test]
+#[ignore = "requires LocalStack (run with: cargo test -p sulfite-tools --test localstack_cli -- --ignored)"]
+async fn cli_csv_copy_cross_clients() {
+    let client = make_client().await;
+    ensure_bucket(&client, TEST_BUCKET).await;
+    let run = generate_random_hex(RANDOM_HEX_LEN);
+    let src_prefix = format!("cli-csv-copy-cross/{run}/src/");
+    let dst_prefix = format!("cli-csv-copy-cross/{run}/dst/");
+    let keys = ["first", "second"];
+
+    for key in keys {
+        client
+            .put_object(
+                TEST_BUCKET,
+                &format!("{src_prefix}{key}"),
+                format!("body-{key}").as_bytes(),
+                None,
+            )
+            .await
+            .expect("put source object");
+    }
+
+    let base = std::env::temp_dir()
+        .join("sulfite_cli_csv_copy_cross_clients")
+        .join(&run);
+    std::fs::create_dir_all(&base).expect("create test directory");
+    let manifest = base.join("keys.csv");
+    std::fs::write(&manifest, "key\nfirst\nsecond\n").expect("write CSV");
+    let endpoint = localstack_endpoint();
+    let (ok, _stdout, stderr) = run_cli(&[
+        "csv",
+        manifest.to_str().unwrap(),
+        "--has-header",
+        "copy-cross-clients",
+        "--src-bucket",
+        TEST_BUCKET,
+        "--src-prefix",
+        &src_prefix,
+        "--dst-bucket",
+        TEST_BUCKET,
+        "--dst-prefix",
+        &dst_prefix,
+        "--dst-endpoint-url",
+        &endpoint,
+        "--dst-region",
+        "us-east-1",
+    ]);
+    assert!(ok, "CLI CSV cross-client copy failed: stderr={stderr}");
+
+    for key in keys {
+        let (_, copied) = client
+            .get_object(TEST_BUCKET, &format!("{dst_prefix}{key}"), None)
+            .await
+            .expect("get copied object");
+        assert_eq!(copied, format!("body-{key}").as_bytes());
+        let _ = client
+            .delete_object(TEST_BUCKET, &format!("{src_prefix}{key}"))
+            .await;
+        let _ = client
+            .delete_object(TEST_BUCKET, &format!("{dst_prefix}{key}"))
+            .await;
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }

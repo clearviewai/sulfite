@@ -4,7 +4,7 @@
 //! no external retry crate types are exposed in the public API.
 
 use std::time::Duration;
-use tokio_retry::strategy::{jitter, ExponentialBackoff, FibonacciBackoff, FixedInterval};
+use tokio_retry::strategy::{ExponentialBackoff, FibonacciBackoff, FixedInterval, jitter};
 
 /// Configuration for how failed operations are retried.
 ///

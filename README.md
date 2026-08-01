@@ -35,6 +35,7 @@ Global options (can be used with any subcommand):
 
 - `--region`, `-r` — AWS region (or region of custom endpoint)
 - `--endpoint-url`, `-e` — S3 endpoint URL (e.g. for MinIO)
+- `--profile` — AWS profile for the primary/source client
 - `--max-retries` — Maximum retries per request (default: 3)
 - `--retriable-client-status-codes` — HTTP status codes to treat as retriable (comma-separated; default: 408,429)
 - `--read-timeout` — Read timeout in seconds for the HTTP client (default: 60)
@@ -51,6 +52,8 @@ Global options (can be used with any subcommand):
 | `upload-multipart` | Upload one object (multipart transfer) |
 | `delete` | Delete one object |
 | `copy` | Copy one object from source to destination |
+| `copy-multipart` | Copy within one S3 backend using server-side multipart ranges |
+| `copy-multipart-cross-clients` | Copy across independently configured S3 backends through bounded memory |
 | `restore` | Restore one object from archival storage (e.g. Glacier) |
 | `csv` | Run one operation per key from a CSV file (batch) |
 
@@ -91,6 +94,12 @@ sulfite upload-multipart -b my-bucket -k path/to/object -l local-file
 
 # Use custom endpoint (e.g. MinIO)
 sulfite -e https://minio.example.com list -b my-bucket -p ""
+
+# Copy across two S3-compatible backends without local disk
+sulfite --endpoint-url https://source.example.com --profile source \
+  copy-multipart-cross-clients --src-bucket source-bucket --src-key path/object \
+  --dst-endpoint-url https://destination.example.com --dst-profile destination \
+  --dst-bucket destination-bucket --dst-key path/object
 ```
 
 ### CSV workflow
@@ -107,11 +116,13 @@ sulfite csv manifest.csv --has-header download -b my-bucket -p my/prefix/ -l ./d
 
 Use `--column-idx/-c N` if the key column is not the first (0-based index).
 
-**CSV skip behavior** — For `csv download` and `csv upload`, an item is skipped if the destination already exists with the same size and a destination timestamp that is not older than the source. Otherwise the existing file or object is overwritten. This avoids re-transferring unchanged files when re-running a batch.
+To copy a manifest across independently configured S3 clients, use `csv ... copy-cross-clients` with the source bucket/prefix and destination bucket/prefix. Destination connection options are `--dst-endpoint-url`, `--dst-region`, and `--dst-profile`.
 
-**Multipart activation** — In CSV batch mode, download uses a single GET for objects under 1 GB and multipart for ≥ 1 GB. Upload uses single-part for under 1 GB and multipart for ≥ 1 GB. The single-object commands `download` / `upload` always use one request; `download-multipart` / `upload-multipart` always use multipart.
+**CSV skip behavior** — By default, `csv download` and `csv upload` overwrite an existing destination. Pass `--skip-existing-with-inference` before the operation subcommand to infer unchanged items: when both the local file and S3 object exist, the item is skipped if they have the same size and the S3 timestamp is not older than the local timestamp. For example: `sulfite csv manifest.csv --has-header --skip-existing-with-inference download ...`.
 
-**Archival and small files** — When you specify an archival storage class (e.g. `--storage-class GLACIER`) on `csv upload` or `csv copy`, objects under 16 KB are stored as STANDARD instead of the requested class, for efficiency.
+**Multipart activation** — In CSV batch mode, download uses a single GET for objects under 1 GB and multipart for ≥ 1 GB. Upload uses single-part for under 1 GB and multipart for ≥ 1 GB. Cross-client copy uses an in-memory GET followed by PUT for objects under 20 MiB and bounded-memory multipart transfer for ≥ 20 MiB. The single-object commands `download` / `upload` always use one request; `download-multipart` / `upload-multipart` always use multipart.
+
+**Archival and small files** — When you specify an archival storage class with `--storage-class GLACIER` on `csv upload`, or `--dst-storage-class GLACIER` on `csv copy` and `csv copy-cross-clients`, objects under 16 KB are stored as STANDARD instead of the requested class, for efficiency.
 
 Run `sulfite --help` or `sulfite <command> --help` for full options.
 

@@ -7,7 +7,7 @@
 //! Cleanup is best-effort; the LocalStack container can be removed to reset state.
 
 use rstest::rstest;
-use sulfite::{generate_random_hex, RetryConfig, S3Client, S3ClientConfig, S3Error};
+use sulfite::{RetryConfig, S3Client, S3ClientConfig, S3Error, generate_random_hex};
 
 const DEFAULT_LOCALSTACK_ENDPOINT: &str = "http://localhost:4566";
 const TEST_BUCKET: &str = "sulfite-test-bucket";
@@ -467,7 +467,7 @@ async fn put_glacier_get_fails_restore_then_get_succeeds() {
     let _ = client.delete_object(TEST_BUCKET, &key).await;
 }
 
-// Multipart upload then multipart download per size; each case runs as a separate test (parallel). Run with: cargo test -p sulfite --test localstack -- --ignored
+// Multipart upload, in-memory copy, then multipart download per size; each case runs as a separate test (parallel). Run with: cargo test -p sulfite --test localstack -- --ignored
 #[rstest]
 #[case(1_u64)]
 #[case(10_u64)]
@@ -475,7 +475,7 @@ async fn put_glacier_get_fails_restore_then_get_succeeds() {
 #[case(100_u64)]
 #[tokio::test]
 #[ignore = "requires LocalStack (run with: cargo test --test localstack -- --ignored)"]
-async fn multipart_upload_download_size(#[case] size_mb: u64) {
+async fn multipart_upload_copy_download_size(#[case] size_mb: u64) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CHUNK: usize = 1024 * 1024; // 1 MiB for chunked compare
@@ -485,6 +485,7 @@ async fn multipart_upload_download_size(#[case] size_mb: u64) {
     ensure_bucket(&client, TEST_BUCKET).await;
     let run = generate_random_hex(RANDOM_HEX_LEN);
     let key = format!("multipart/{}/{}mb", run, size_mb);
+    let copy_key = format!("multipart/{}/{}mb-copy", run, size_mb);
 
     let base = localstack_test_base(&run);
     let _ = tokio::fs::create_dir_all(&base).await;
@@ -524,11 +525,29 @@ async fn multipart_upload_download_size(#[case] size_mb: u64) {
         .expect("head_object after upload");
     assert_eq!(up_info.size, size, "size {} MiB", size_mb);
 
-    // Multipart download to second file
+    // Copy through bounded in-memory parts, then verify the destination size.
+    client
+        .copy_object_multipart(
+            TEST_BUCKET,
+            &key,
+            TEST_BUCKET,
+            &copy_key,
+            None,
+            None::<&sulfite::NoopProgressBar>,
+        )
+        .await
+        .expect("copy_object_multipart");
+    let copy_info = client
+        .head_object(TEST_BUCKET, &copy_key)
+        .await
+        .expect("head_object after copy");
+    assert_eq!(copy_info.size, size, "copied size {} MiB", size_mb);
+
+    // Multipart download the copy to a second file.
     client
         .download_object_multipart(
             TEST_BUCKET,
-            &key,
+            &copy_key,
             download_path.to_str().unwrap(),
             None::<&sulfite::NoopProgressBar>,
         )
@@ -570,5 +589,6 @@ async fn multipart_upload_download_size(#[case] size_mb: u64) {
 
     // Cleanup: object and temp dir (upload/download files)
     let _ = client.delete_object(TEST_BUCKET, &key).await;
+    let _ = client.delete_object(TEST_BUCKET, &copy_key).await;
     let _ = tokio::fs::remove_dir_all(&base).await;
 }
