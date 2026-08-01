@@ -388,7 +388,7 @@ pub enum CsvCommand {
         #[arg(long)]
         src_bucket: String,
         /// The prefix prepended to each key for the source.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         src_prefix: String,
         /// The suffix appended to each key for the source.
         #[arg(long, default_value = "")]
@@ -397,7 +397,7 @@ pub enum CsvCommand {
         #[arg(long)]
         dst_bucket: String,
         /// The prefix prepended to each key for the destination.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         dst_prefix: String,
         /// The suffix appended to each key for the destination.
         #[arg(long, default_value = "")]
@@ -412,7 +412,7 @@ pub enum CsvCommand {
         #[arg(long)]
         src_bucket: String,
         /// The prefix prepended to each key for the source.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         src_prefix: String,
         /// The suffix appended to each key for the source.
         #[arg(long, default_value = "")]
@@ -421,7 +421,7 @@ pub enum CsvCommand {
         #[arg(long)]
         dst_bucket: String,
         /// The prefix prepended to each key for the destination.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         dst_prefix: String,
         /// The suffix appended to each key for the destination.
         #[arg(long, default_value = "")]
