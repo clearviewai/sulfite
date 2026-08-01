@@ -1842,12 +1842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "partial_application"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f926567968c32d22274b8eb721210363e54dcd8d2c960dd8533aa3be78143081"
-
-[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2405,9 +2399,9 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "filetime",
+ "futures",
  "indicatif",
  "log",
- "partial_application",
  "rand",
  "rstest",
  "thiserror",

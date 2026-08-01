@@ -36,15 +36,11 @@ pub async fn run_list(client: S3Client, args: ListArgs) -> anyhow::Result<()> {
             object_count += 1;
             if let Some(w) = &mut writer {
                 let mut key = obj.key.clone();
-                if !keep_prefix {
-                    if let Some(s) = key.strip_prefix(prefix.as_str()) {
-                        key = s.to_string();
-                    }
+                if !keep_prefix && let Some(s) = key.strip_prefix(prefix.as_str()) {
+                    key = s.to_string();
                 }
-                if remove_suffix {
-                    if let Some(s) = key.strip_suffix(suffix) {
-                        key = s.to_string();
-                    }
+                if remove_suffix && let Some(s) = key.strip_suffix(suffix) {
+                    key = s.to_string();
                 }
                 let _ = w.write_record([
                     key.as_str(),
