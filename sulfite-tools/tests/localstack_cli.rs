@@ -416,6 +416,7 @@ async fn cli_csv_list_then_download() {
     let (ok_dl, _stdout, stderr_dl) = run_cli(&[
         "csv",
         manifest_s,
+        "--has-header",
         "download",
         "--bucket",
         TEST_BUCKET,
