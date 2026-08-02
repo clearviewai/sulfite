@@ -165,9 +165,6 @@ pub struct DownloadMultipartArgs {
     /// The local path to write to (defaults to current directory with filename from key).
     #[arg(short, long)]
     pub local_path: Option<String>,
-    /// The number of parallel workers for part downloads.
-    #[arg(short, long, default_value = "250")]
-    pub n_workers: usize,
 }
 
 #[derive(Parser, Clone)]
@@ -200,9 +197,6 @@ pub struct UploadMultipartArgs {
     /// The storage class (e.g. STANDARD, GLACIER).
     #[arg(long)]
     pub storage_class: Option<String>,
-    /// The number of parallel workers for part uploads.
-    #[arg(short, long, default_value = "250")]
-    pub n_workers: usize,
 }
 
 #[derive(Parser, Clone)]
